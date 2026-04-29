@@ -89,6 +89,8 @@ class DatabaseManager:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT UNIQUE NOT NULL,
                     pin_hash TEXT NOT NULL,
+                    password_hash TEXT,
+                    is_admin INTEGER NOT NULL DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -99,35 +101,73 @@ class DatabaseManager:
                     user_id INTEGER NOT NULL,
                     face_encoding BLOB NOT NULL,
                     description TEXT,
+                    image_data BLOB,
+                    source_filename TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
                 )
             """)
-            
+
+            self._ensure_face_encoding_columns()
+            self._ensure_user_columns()
             self.conn.commit()
             logger.debug("Datenbanktabellen erstellt/überprüft")
         except Exception as e:
             logger.error(f"Fehler beim Erstellen der Tabellen: {e}")
             raise DatabaseError(f"Tabellenerstellung fehlgeschlagen: {e}")
+
+    def _ensure_face_encoding_columns(self):
+        """Ergänzt neue Spalten für Bildvorschau und Metadaten bei bestehenden Datenbanken."""
+        self.cursor.execute("PRAGMA table_info(face_encodings)")
+        columns = {row[1] for row in self.cursor.fetchall()}
+        if "image_data" not in columns:
+            self.cursor.execute("ALTER TABLE face_encodings ADD COLUMN image_data BLOB")
+        if "source_filename" not in columns:
+            self.cursor.execute("ALTER TABLE face_encodings ADD COLUMN source_filename TEXT")
+        if "created_at" not in columns:
+            self.cursor.execute("ALTER TABLE face_encodings ADD COLUMN created_at TIMESTAMP")
+
+    def _ensure_user_columns(self):
+        """Migriert ältere users-Tabellen auf das aktuelle Schema (Passwort, Admin-Flag)."""
+        self.cursor.execute("PRAGMA table_info(users)")
+        columns = {row[1] for row in self.cursor.fetchall()}
+        if "password_hash" not in columns:
+            self.cursor.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
+        if "is_admin" not in columns:
+            self.cursor.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
     
     def get_thread_connection(self) -> Tuple[sqlite3.Connection, sqlite3.Cursor]:
         """Erstellt eine neue Datenbankverbindung für Thread-Sicherheit"""
         conn = sqlite3.connect(str(self.db_path))
         return conn, conn.cursor()
     
-    def add_user(self, name: str, pin: str) -> int:
-        """Fügt einen neuen Benutzer hinzu"""
+    def add_user(self, name: str, pin: str, password: Optional[str] = None,
+                 is_admin: bool = False) -> int:
+        """Fügt einen neuen Benutzer hinzu.
+
+        ``password`` ist optional; wird es übergeben, wird zusätzlich zur PIN ein
+        Passwort-Hash gespeichert. ``is_admin`` markiert den Benutzer als Admin.
+        """
         if len(pin) < Config.MIN_PIN_LENGTH:
             raise ValueError(f"PIN muss mindestens {Config.MIN_PIN_LENGTH} Zeichen lang sein")
-        
+        if password is not None and len(password) < Config.MIN_PASSWORD_LENGTH:
+            raise ValueError(
+                f"Passwort muss mindestens {Config.MIN_PASSWORD_LENGTH} Zeichen lang sein"
+            )
+
         pin_hash = SecurityUtils.hash_pin_pbkdf2(pin)
-        
+        password_hash = SecurityUtils.hash_pin_pbkdf2(password) if password else None
+
         try:
-            self.cursor.execute("INSERT INTO users (name, pin_hash) VALUES (?, ?)", 
-                              (name, pin_hash))
+            self.cursor.execute(
+                "INSERT INTO users (name, pin_hash, password_hash, is_admin) VALUES (?, ?, ?, ?)",
+                (name, pin_hash, password_hash, 1 if is_admin else 0),
+            )
             user_id = self.cursor.lastrowid
             self.conn.commit()
-            logger.info(f"Benutzer '{name}' hinzugefügt (ID: {user_id})")
+            logger.info(
+                "Benutzer '%s' hinzugefügt (ID: %s, admin=%s)", name, user_id, is_admin
+            )
             return user_id
         except sqlite3.IntegrityError:
             raise ValueError(f"Benutzername '{name}' existiert bereits")
@@ -135,14 +175,30 @@ class DatabaseManager:
             logger.error(f"Fehler beim Hinzufügen des Benutzers: {e}")
             raise DatabaseError(f"Benutzer konnte nicht hinzugefügt werden: {e}")
     
-    def add_face_encoding(self, user_id: int, face_encoding: np.ndarray, 
-                         description: str = "") -> int:
+    def add_face_encoding(
+        self,
+        user_id: int,
+        face_encoding: np.ndarray,
+        description: str = "",
+        image_data: Optional[bytes] = None,
+        source_filename: Optional[str] = None,
+    ) -> int:
         """Fügt eine Gesichtskodierung für einen Benutzer hinzu"""
         try:
             encoding_blob = sqlite3.Binary(face_encoding.tobytes())
             self.cursor.execute(
-                "INSERT INTO face_encodings (user_id, face_encoding, description) VALUES (?, ?, ?)",
-                (user_id, encoding_blob, description)
+                """
+                INSERT INTO face_encodings
+                (user_id, face_encoding, description, image_data, source_filename)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    encoding_blob,
+                    description,
+                    sqlite3.Binary(image_data) if image_data is not None else None,
+                    source_filename,
+                )
             )
             encoding_id = self.cursor.lastrowid
             self.conn.commit()
@@ -160,6 +216,16 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Fehler beim Abrufen der Benutzer: {e}")
             raise DatabaseError(f"Benutzer konnten nicht abgerufen werden: {e}")
+
+    def get_user_id(self, user_name: str) -> Optional[int]:
+        """Gibt die Benutzer-ID zu einem Namen zurück."""
+        try:
+            self.cursor.execute("SELECT id FROM users WHERE name = ?", (user_name,))
+            row = self.cursor.fetchone()
+            return row[0] if row else None
+        except Exception as e:
+            logger.error(f"Fehler beim Abrufen der Benutzer-ID: {e}")
+            raise DatabaseError(f"Benutzer-ID konnte nicht abgerufen werden: {e}")
     
     def get_user_face_encodings(self, user_name: str) -> List[Tuple[str, np.ndarray]]:
         """Gibt alle Gesichtskodierungen für einen Benutzer zurück"""
@@ -180,6 +246,27 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Fehler beim Abrufen der Gesichtskodierungen: {e}")
             raise DatabaseError(f"Gesichtskodierungen konnten nicht abgerufen werden: {e}")
+
+    def get_user_face_records(self, user_name: str) -> List[Tuple[int, str, Optional[bytes], Optional[str], str]]:
+        """Gibt die gespeicherten Bilder und Metadaten für einen Benutzer zurück."""
+        try:
+            self.cursor.execute("PRAGMA table_info(face_encodings)")
+            columns = {row[1] for row in self.cursor.fetchall()}
+            has_created_at = "created_at" in columns
+            created_at_select = "fe.created_at" if has_created_at else "NULL AS created_at"
+            order_by = "ORDER BY fe.created_at ASC, fe.id ASC" if has_created_at else "ORDER BY fe.id ASC"
+
+            self.cursor.execute(f"""
+                SELECT fe.id, fe.description, fe.image_data, fe.source_filename, {created_at_select}
+                FROM face_encodings fe
+                JOIN users u ON fe.user_id = u.id
+                WHERE u.name = ?
+                {order_by}
+            """, (user_name,))
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.error(f"Fehler beim Abrufen der Bilddaten: {e}")
+            raise DatabaseError(f"Bilddaten konnten nicht abgerufen werden: {e}")
     
     def get_all_face_encodings(self) -> List[Tuple[str, np.ndarray, str]]:
         """Gibt alle Gesichtskodierungen mit Benutzernamen zurück"""
@@ -221,6 +308,110 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Fehler bei PIN-Verifikation: {e}")
             return False
+
+    # ------------------------------------------------------------------
+    # Passwort- / Admin-Verwaltung
+    # ------------------------------------------------------------------
+
+    def has_users(self) -> bool:
+        """True, wenn mindestens ein Benutzer existiert."""
+        try:
+            self.cursor.execute("SELECT 1 FROM users LIMIT 1")
+            return self.cursor.fetchone() is not None
+        except Exception as e:
+            logger.error(f"Fehler beim Prüfen auf vorhandene Benutzer: {e}")
+            return False
+
+    def has_admin(self) -> bool:
+        """True, wenn mindestens ein Admin existiert."""
+        try:
+            self.cursor.execute("SELECT 1 FROM users WHERE is_admin = 1 LIMIT 1")
+            return self.cursor.fetchone() is not None
+        except Exception as e:
+            logger.error(f"Fehler beim Prüfen auf vorhandene Admins: {e}")
+            return False
+
+    def get_users_with_meta(self) -> List[Tuple[int, str, bool, bool]]:
+        """Liste aller Benutzer mit (id, name, is_admin, has_password)."""
+        try:
+            self.cursor.execute(
+                "SELECT id, name, is_admin, password_hash FROM users ORDER BY name"
+            )
+            return [
+                (row[0], row[1], bool(row[2]), bool(row[3]))
+                for row in self.cursor.fetchall()
+            ]
+        except Exception as e:
+            logger.error(f"Fehler beim Abrufen der Benutzer-Metadaten: {e}")
+            return []
+
+    def set_user_password(self, user_name: str, password: str) -> bool:
+        """Setzt/aktualisiert das Passwort eines Benutzers."""
+        if len(password) < Config.MIN_PASSWORD_LENGTH:
+            raise ValueError(
+                f"Passwort muss mindestens {Config.MIN_PASSWORD_LENGTH} Zeichen lang sein"
+            )
+        try:
+            password_hash = SecurityUtils.hash_pin_pbkdf2(password)
+            self.cursor.execute(
+                "UPDATE users SET password_hash = ? WHERE name = ?",
+                (password_hash, user_name),
+            )
+            self.conn.commit()
+            return self.cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Fehler beim Setzen des Passworts: {e}")
+            raise DatabaseError(f"Passwort konnte nicht gesetzt werden: {e}")
+
+    def set_user_admin(self, user_name: str, is_admin: bool) -> bool:
+        """Setzt/entfernt das Admin-Flag."""
+        try:
+            self.cursor.execute(
+                "UPDATE users SET is_admin = ? WHERE name = ?",
+                (1 if is_admin else 0, user_name),
+            )
+            self.conn.commit()
+            return self.cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Fehler beim Setzen des Admin-Flags: {e}")
+            return False
+
+    def verify_user_password(self, user_name: str, password: str) -> bool:
+        """Prüft das Passwort eines konkreten Benutzers."""
+        if not password:
+            return False
+        try:
+            self.cursor.execute(
+                "SELECT password_hash FROM users WHERE name = ?", (user_name,)
+            )
+            row = self.cursor.fetchone()
+            if not row or not row[0]:
+                return False
+            return SecurityUtils.verify_pin(password, row[0])
+        except Exception as e:
+            logger.error(f"Fehler bei Passwort-Verifikation: {e}")
+            return False
+
+    def find_user_by_password(self, password: str, admin_only: bool = False) -> Optional[Tuple[int, str, bool]]:
+        """Sucht einen Benutzer, dessen Passwort matcht.
+
+        Liefert (id, name, is_admin) oder ``None``. Bei ``admin_only=True``
+        werden nur Admin-Benutzer berücksichtigt.
+        """
+        if not password:
+            return None
+        try:
+            sql = "SELECT id, name, is_admin, password_hash FROM users WHERE password_hash IS NOT NULL"
+            if admin_only:
+                sql += " AND is_admin = 1"
+            self.cursor.execute(sql)
+            for uid, name, is_admin, stored in self.cursor.fetchall():
+                if SecurityUtils.verify_pin(password, stored):
+                    return (uid, name, bool(is_admin))
+            return None
+        except Exception as e:
+            logger.error(f"Fehler bei Benutzer-Passwort-Suche: {e}")
+            return None
     
     def delete_user(self, user_name: str) -> bool:
         """Löscht einen Benutzer und alle zugehörigen Daten"""

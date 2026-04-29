@@ -18,7 +18,13 @@ from pathlib import Path
 from typing import Optional, Callable, List, Tuple
 from threading import Timer
 
-import face_recognition
+from face_mediapipe import (
+    load_image_file,
+    face_locations as mp_face_locations,
+    face_encodings as mp_face_encodings,
+    compare_faces,
+    face_distance,
+)
 import tkinter as tk
 from tkinter import messagebox, Toplevel, Label
 from PIL import Image, ImageTk
@@ -51,6 +57,10 @@ class CameraManager:
         # Kamera-Hardware
         self.video_capture = None
         self.camera_thread = None
+        self.camera_after_id = None
+        self.last_state = None
+        self.state_since = 0.0
+        self.state_candidate = None
         
         # Lock-Datei
         self.lock_file = Config.CAMERA_LOCK_FILE
@@ -61,15 +71,28 @@ class CameraManager:
         # Callbacks
         self.user_recognized_callback: Optional[Callable[[str], None]] = None
         self.unauthorized_access_callback: Optional[Callable[[], None]] = None
+        self.preview_updated_callback: Optional[Callable[[Image.Image, str, str], None]] = None
+        # Wird auf JEDEM Frame mit erkanntem legitimen Nutzer ausgelöst (kein Logging,
+        # nur Heartbeat zum Zurücksetzen des Sperr-Timers).
+        self.user_seen_callback: Optional[Callable[[str], None]] = None
         
         # Initialisiere Kamera-Verfügbarkeit
         self.is_available = self._check_availability()
     
     def set_callbacks(self, user_recognized: Optional[Callable[[str], None]] = None,
-                     unauthorized_access: Optional[Callable[[], None]] = None):
-        """Setzt Callback-Funktionen für Ereignisse"""
+                     unauthorized_access: Optional[Callable[[], None]] = None,
+                     preview_updated: Optional[Callable[[Image.Image, str, str], None]] = None,
+                     user_seen: Optional[Callable[[str], None]] = None):
+        """Setzt Callback-Funktionen für Ereignisse.
+
+        ``user_seen`` wird für jeden Frame ausgelöst, in dem ein legitimer Nutzer
+        erkannt wurde (Heartbeat). ``user_recognized`` feuert weiterhin nur bei
+        Statuswechseln (fürs Logging).
+        """
         self.user_recognized_callback = user_recognized
         self.unauthorized_access_callback = unauthorized_access
+        self.preview_updated_callback = preview_updated
+        self.user_seen_callback = user_seen
     
     def _check_availability(self) -> bool:
         """Prüft, ob eine Kamera verfügbar ist"""
@@ -182,6 +205,7 @@ class CameraManager:
         dlg = self.permission_dialog
         dlg.title("Kamera-Zugriff erkannt")
         dlg.geometry(Config.CAMERA_PERMISSION_DIALOG_GEOMETRY)
+        dlg.minsize(380, 220)
         dlg.transient(self.parent_window)
         dlg.grab_set()
         
@@ -192,6 +216,7 @@ class CameraManager:
         dlg.geometry(f"400x250+{x}+{y}")
         dlg.attributes('-topmost', True)
         dlg.focus_force()
+        dlg.resizable(True, True)
         
         Label(dlg, text="Ein anderes Programm versucht,\ndie Kamera zu nutzen.",
               font=('Arial', 12, 'bold')).pack(pady=20)
@@ -278,14 +303,11 @@ class CameraManager:
             )
             return False
         
-        # Starte Kamera-Thread
-        self.camera_thread = threading.Thread(
-            target=self._run_camera, 
-            daemon=True, 
-            name="CameraCapture"
-        )
-        self.camera_thread.start()
         self.is_active = True
+        self.last_state = None
+        self.state_since = time.time()
+        self.state_candidate = None
+        self.camera_after_id = self.parent_window.after(0, self._run_camera_step)
         
         logger.info("Kamera-Aufnahme gestartet")
         return True
@@ -294,6 +316,12 @@ class CameraManager:
         """Stoppt die Kamera-Aufnahme"""
         self.active_event.clear()
         self.is_active = False
+        if self.camera_after_id is not None:
+            try:
+                self.parent_window.after_cancel(self.camera_after_id)
+            except Exception:
+                pass
+            self.camera_after_id = None
         
         if self.video_capture:
             try:
@@ -306,142 +334,274 @@ class CameraManager:
         self.stop_monitoring()
         
         logger.info("Kamera-Aufnahme gestoppt")
+
+    def _build_preview_image(
+        self,
+        frame: np.ndarray,
+        face_locations: List[Tuple[int, int, int, int]],
+        face_names: List[str],
+    ) -> Image.Image:
+        """Erstellt eine annotierte Vorschau für die Monitoring-UI."""
+        preview_frame = frame.copy()
+
+        for index, (top, right, bottom, left) in enumerate(face_locations):
+            name = face_names[index] if index < len(face_names) else "Unbekannt"
+            color = (76, 175, 80) if name != "Unbekannt" else (255, 82, 82)
+            cv2.rectangle(preview_frame, (left, top), (right, bottom), color, 2)
+            cv2.rectangle(
+                preview_frame,
+                (left, max(bottom - 22, top)),
+                (right, bottom),
+                color,
+                cv2.FILLED,
+            )
+            cv2.putText(
+                preview_frame,
+                name,
+                (left + 4, max(bottom - 6, top + 14)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 0, 0),
+                1,
+            )
+
+        display_rgb = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
+        image = Image.fromarray(display_rgb)
+        image.thumbnail((360, 220), Image.Resampling.LANCZOS)
+        return image
     
-    def _run_camera(self):
-        """Hauptschleife für Kamera-Aufnahme und Gesichtserkennung"""
-        # Verwende separate DB-Verbindung für Thread
-        with DatabaseManager() as db:
-            try:
-                last_state = None  # None, 'authorized', 'unauthorized'
-                state_since = time.time()
-                state_candidate = None
-                GRACE_PERIOD = 1.0  # seconds (reduced for faster security response)
-                while self.active_event.is_set():
-                    ret, frame = self.video_capture.read()
-                    if not ret:
-                        logger.warning("Kein Frame von Kamera empfangen")
+    def _run_camera_step(self):
+        """Verarbeitet einen Kamera-Schritt im Tk-Hauptthread."""
+        if not self.active_event.is_set() or not self.video_capture:
+            self.camera_after_id = None
+            return
+
+        try:
+            ret, frame = self.video_capture.read()
+            if not ret:
+                logger.warning("Kein Frame von Kamera empfangen")
+                self.camera_after_id = self.parent_window.after(250, self._run_camera_step)
+                return
+
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            face_locations = mp_face_locations(rgb_frame)
+            face_encodings = mp_face_encodings(rgb_frame, face_locations)
+
+            user_recognized = False
+            recognized_user = None
+            face_names: List[str] = []
+
+            if face_encodings:
+                known_encodings = self.db_manager.get_all_face_encodings()
+
+                for face_encoding in face_encodings:
+                    current_name = "Unbekannt"
+                    for name, known_encoding, desc in known_encodings:
+                        matches = compare_faces([known_encoding], face_encoding)
+                        if matches and matches[0]:
+                            user_recognized = True
+                            recognized_user = name
+                            current_name = name
+                            logger.info(f"Benutzer erkannt: {name}")
+                            break
+                    face_names.append(current_name)
+
+                    if user_recognized:
                         break
-                    
-                    # Konvertiere zu RGB für face_recognition
-                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    
-                    # Erkenne Gesichter
-                    face_locations = face_recognition.face_locations(rgb_frame)
-                    face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
-                    
-                    user_recognized = False
-                    recognized_user = None
 
-                    if face_encodings:
-                        # Lade alle bekannten Gesichtskodierungen
-                        known_encodings = db.get_all_face_encodings()
+            current_state = 'authorized' if user_recognized else 'unauthorized'
+            grace_period = 1.0
 
-                        for face_encoding in face_encodings:
-                            for name, known_encoding, desc in known_encodings:
-                                # Vergleiche Gesichtskodierungen
-                                matches = face_recognition.compare_faces([known_encoding], face_encoding)
-                                if matches[0]:
-                                    user_recognized = True
-                                    recognized_user = name
-                                    logger.info(f"Benutzer erkannt: {name}")
-                                    break
+            if face_locations:
+                if user_recognized and recognized_user:
+                    preview_status = f"Legitimer Nutzer erkannt: {recognized_user}"
+                    preview_level = "SUCCESS"
+                elif face_names:
+                    preview_status = "Gesicht erkannt: Unbekannt"
+                    preview_level = "ERROR"
+                else:
+                    preview_status = "Gesicht erkannt"
+                    preview_level = "INFO"
+            else:
+                preview_status = "Kein Gesicht erkannt"
+                preview_level = "WARNING"
 
-                            if user_recognized:
-                                break
+            if self.preview_updated_callback:
+                preview_image = self._build_preview_image(frame, face_locations, face_names)
+                self.preview_updated_callback(preview_image, preview_status, preview_level)
 
-                    # Debounce logic: only change state if new state persists for GRACE_PERIOD
-                    current_state = 'authorized' if user_recognized else 'unauthorized'
-                    if state_candidate is None or current_state != state_candidate:
-                        state_candidate = current_state
-                        state_since = time.time()
-                    elif time.time() - state_since >= GRACE_PERIOD and last_state != state_candidate:
-                        # State has been stable for GRACE_PERIOD, trigger callback
-                        if state_candidate == 'authorized':
-                            if self.user_recognized_callback:
-                                self.user_recognized_callback(recognized_user)
+            # Heartbeat: jeder Frame mit legitimem Nutzer setzt den Sperr-Timer zurück,
+            # auch wenn die Erkennung nur kurz war (kein Warten auf Grace-Period).
+            if user_recognized and recognized_user and self.user_seen_callback:
+                try:
+                    self.user_seen_callback(recognized_user)
+                except Exception as cb_exc:
+                    logger.debug("user_seen_callback fehlgeschlagen: %s", cb_exc)
+
+            if self.state_candidate is None or current_state != self.state_candidate:
+                self.state_candidate = current_state
+                self.state_since = time.time()
+            elif time.time() - self.state_since >= grace_period and self.last_state != self.state_candidate:
+                if self.state_candidate == 'authorized':
+                    if self.user_recognized_callback:
+                        self.user_recognized_callback(recognized_user)
+                else:
+                    if self.unauthorized_access_callback:
+                        if face_encodings:
+                            logger.warning("Unbekanntes Gesicht erkannt")
                         else:
-                            if self.unauthorized_access_callback:
-                                if face_encodings:
-                                    logger.warning("Unbekanntes Gesicht erkannt")
-                                else:
-                                    logger.warning("Kein Gesicht erkannt (Kamera abgedeckt oder niemand im Bild)")
-                                self.unauthorized_access_callback()
-                        last_state = state_candidate
-                    
-                    # Kleine Pause um CPU zu schonen
-                    time.sleep(0.1)
-            
-            except Exception as e:
-                logger.error(f"Fehler in Kamera-Thread: {e}\n{traceback.format_exc()}")
+                            logger.warning("Kein Gesicht erkannt (Kamera abgedeckt oder niemand im Bild)")
+                        self.unauthorized_access_callback()
+                self.last_state = self.state_candidate
+
+        except Exception as e:
+            logger.error(f"Fehler in Kameraüberwachung: {e}\n{traceback.format_exc()}")
+
+        self.camera_after_id = self.parent_window.after(100, self._run_camera_step)
     
     def capture_image(self) -> Optional[str]:
-        """Nimmt ein Bild mit der Webcam auf und gibt den Pfad zurück"""
+        """Nimmt ein Bild mit der Webcam auf und gibt den Pfad zurück.
+
+        Während der Vorschau wird live angezeigt, ob ein Gesicht erkannt wird,
+        damit der Nutzer das Foto erst auslöst, wenn die Erkennung stabil ist.
+        """
         cam = cv2.VideoCapture(0)
         if not cam.isOpened():
             messagebox.showerror("Fehler", "Kamera konnte nicht geöffnet werden.")
             return None
-        
+
         win = Toplevel(self.parent_window)
         win.title("Webcam - Foto aufnehmen")
-        win.geometry("700x550")
+        win.geometry("760x620")
+        win.minsize(560, 460)
+        win.resizable(True, True)
         win.transient(self.parent_window)
         win.grab_set()
-        
-        label_main = Label(win)
-        label_main.pack(pady=10)
-        
-        captured = {'img': None}
-        closed = {'done': False}
-        
+        win.configure(bg="#1d1d1d")
+
+        content = tk.Frame(win, bg="#1d1d1d")
+        content.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        Label(
+            content,
+            text="Positionieren Sie Ihr Gesicht im Bild (frontal oder seitlich).",
+            font=("Arial", 11, "bold"),
+            fg="#ffffff",
+            bg="#1d1d1d",
+        ).pack(anchor="w")
+
+        label_main = Label(content, bg="#000000")
+        label_main.pack(fill=tk.BOTH, expand=True, pady=(8, 4))
+
+        status_label = Label(
+            content,
+            text="Suche Gesicht …",
+            font=("Arial", 11, "bold"),
+            fg="#ff9800",
+            bg="#1d1d1d",
+        )
+        status_label.pack(anchor="w", pady=(0, 6))
+
+        captured = {"img": None}
+        closed = {"done": False}
+        last_state = {"face_found": False}
+        # Button-Referenz wird unten gesetzt; type-loose zur Vermeidung von Forward-Refs.
+        capture_button: dict = {"btn": None}
+
         def show_frame():
-            if closed['done']:
+            if closed["done"]:
                 return
             ret, frame = cam.read()
             if ret:
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                img_tk = ImageTk.PhotoImage(image=Image.fromarray(rgb))
+                try:
+                    locations = mp_face_locations(rgb)
+                except Exception as exc:
+                    locations = []
+                    logger.debug("Live-Gesichtssuche fehlgeschlagen: %s", exc)
+
+                # Boxen einzeichnen
+                for (top, right, bottom, left) in locations:
+                    color = (76, 175, 80)
+                    cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
+
+                if locations:
+                    status_label.config(
+                        text=f"✓ Gesicht erkannt ({len(locations)})",
+                        fg="#4caf50",
+                    )
+                    if capture_button["btn"] is not None:
+                        capture_button["btn"].config(state=tk.NORMAL)
+                    last_state["face_found"] = True
+                else:
+                    status_label.config(
+                        text="✗ Kein Gesicht erkannt – Position/Beleuchtung anpassen",
+                        fg="#ff5252",
+                    )
+                    if capture_button["btn"] is not None:
+                        capture_button["btn"].config(state=tk.NORMAL)  # Aufnahme bleibt möglich
+                    last_state["face_found"] = False
+
+                display_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(display_rgb)
+                img.thumbnail((720, 460), Image.Resampling.LANCZOS)
+                img_tk = ImageTk.PhotoImage(image=img)
                 label_main.img_tk = img_tk
                 label_main.configure(image=img_tk)
-            if not closed['done']:
-                label_main.after(20, show_frame)
-        
+            if not closed["done"]:
+                label_main.after(80, show_frame)
+
         show_frame()
-        
+
         def capture():
             ret, frame = cam.read()
-            if ret:
-                if cam.isOpened():
-                    cam.release()
-                closed['done'] = True
-                win.destroy()
-                
-                # Speichere Bild in temporärer Datei
-                tmp = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
-                cv2.imwrite(tmp.name, frame)
-                captured['img'] = tmp.name
-                logger.info(f"Bild aufgenommen: {tmp.name}")
-            else:
+            if not ret:
                 messagebox.showerror("Fehler", "Foto konnte nicht aufgenommen werden.")
-        
+                return
+
+            if not last_state["face_found"]:
+                if not messagebox.askokcancel(
+                    "Kein Gesicht erkannt",
+                    "Im aktuellen Bild wurde kein Gesicht erkannt.\n"
+                    "Foto trotzdem aufnehmen?",
+                    parent=win,
+                ):
+                    return
+
+            if cam.isOpened():
+                cam.release()
+            closed["done"] = True
+            win.destroy()
+
+            tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+            cv2.imwrite(tmp.name, frame)
+            captured["img"] = tmp.name
+            logger.info(f"Bild aufgenommen: {tmp.name}")
+
         def on_abort():
             if cam.isOpened():
                 cam.release()
-            closed['done'] = True
+            closed["done"] = True
             win.destroy()
-        
-        tk.Button(win, text="Foto aufnehmen", command=capture).pack(pady=10)
-        tk.Button(win, text="Abbrechen", command=on_abort).pack(pady=5)
+
+        button_frame = tk.Frame(content, bg="#1d1d1d")
+        button_frame.pack(fill=tk.X, pady=(6, 0))
+        capture_button["btn"] = tk.Button(
+            button_frame, text="📷 Foto aufnehmen", command=capture
+        )
+        capture_button["btn"].pack(fill=tk.X, pady=(0, 6))
+        tk.Button(button_frame, text="Abbrechen", command=on_abort).pack(fill=tk.X)
         win.protocol("WM_DELETE_WINDOW", on_abort)
-        
+
         self.parent_window.wait_window(win)
-        
+
         if cam.isOpened():
             cam.release()
-        
-        return captured['img']
+
+        return captured["img"]
     
     def test_camera(self) -> bool:
-        """Zeigt einen Live-Kamera-Test mit Benutzer-Erkennungsanzeige"""
+        """Zeigt einen Live-Kamera-Test mit sichtbarer Gesichtserkennung"""
         cap = None
         running = True
 
@@ -462,6 +622,8 @@ class CameraManager:
             preview_window = Toplevel(self.parent_window)
             preview_window.title("Kamera-Test")
             preview_window.geometry("800x600")
+            preview_window.minsize(640, 480)
+            preview_window.resizable(True, True)
             preview_window.configure(bg="#1d1d1d")
             preview_window.protocol("WM_DELETE_WINDOW", stop_test)
 
@@ -479,9 +641,9 @@ class CameraManager:
 
             status_label = Label(
                 preview_window,
-                text="Keine Benutzer erkannt",
+                text="Kamerasignal wird geprüft",
                 font=("Arial", 11),
-                fg="#ff9800",
+                fg="#4caf50",
                 bg="#1d1d1d"
             )
             status_label.pack(pady=(0, 10))
@@ -491,7 +653,6 @@ class CameraManager:
                 known_names = [name for name, _, _ in known_faces]
                 known_encodings = [encoding for _, encoding, _ in known_faces]
             except Exception as e:
-                known_faces = []
                 known_names = []
                 known_encodings = []
                 logger.warning(f"Gesichtsdaten konnten nicht geladen werden: {e}")
@@ -506,41 +667,51 @@ class CameraManager:
                     preview_window.after(100, update_frame)
                     return
 
-                detection_text = "Keine Benutzer erkannt"
+                detection_text = "Kein Gesicht erkannt"
                 detection_color = "#ff9800"
 
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                face_locations = face_recognition.face_locations(rgb_frame)
-                face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                face_locations = mp_face_locations(frame_rgb)
+                face_encodings = mp_face_encodings(frame_rgb, face_locations)
                 face_names = []
 
-                if face_encodings and known_encodings:
-                    face_names = []
-                    for face_encoding in face_encodings:
-                        matches = face_recognition.compare_faces(known_encodings, face_encoding, tolerance=0.5)
-                        name = "Unbekannt"
-                        face_distances = face_recognition.face_distance(known_encodings, face_encoding)
+                for face_encoding in face_encodings:
+                    name = "Unbekannt"
+                    if known_encodings:
+                        matches = compare_faces(known_encodings, face_encoding, tolerance=0.9)
+                        face_distances = face_distance(known_encodings, face_encoding)
                         if len(face_distances) > 0:
-                            best_match_index = np.argmin(face_distances)
+                            best_match_index = int(np.argmin(face_distances))
                             if matches[best_match_index]:
                                 name = known_names[best_match_index]
-                        face_names.append(name)
+                    face_names.append(name)
 
-                    recognized = [n for n in face_names if n != "Unbekannt"]
-                    if recognized:
-                        detection_text = f"Erkannt: {', '.join(sorted(set(recognized)))}"
+                if face_locations:
+                    if any(name != "Unbekannt" for name in face_names):
+                        recognized = sorted({name for name in face_names if name != "Unbekannt"})
+                        detection_text = f"Erkannt: {', '.join(recognized)}"
                         detection_color = "#4caf50"
-                else:
-                    face_names = ["Unbekannt"] * len(face_locations)
+                    elif face_names:
+                        detection_text = "Gesicht erkannt: Unbekannt"
+                        detection_color = "#ff5252"
 
-                for (top, right, bottom, left), name in zip(face_locations, face_names):
+                for index, (top, right, bottom, left) in enumerate(face_locations):
+                    name = face_names[index] if index < len(face_names) else "Unbekannt"
                     color = (76, 175, 80) if name != "Unbekannt" else (255, 82, 82)
                     cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
-                    cv2.rectangle(frame, (left, bottom - 20), (right, bottom), color, cv2.FILLED)
-                    cv2.putText(frame, name, (left + 4, bottom - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+                    cv2.rectangle(frame, (left, max(bottom - 22, top)), (right, bottom), color, cv2.FILLED)
+                    cv2.putText(
+                        frame,
+                        name,
+                        (left + 4, max(bottom - 6, top + 14)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (0, 0, 0),
+                        1,
+                    )
 
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                img = Image.fromarray(frame_rgb)
+                display_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(display_rgb)
                 img.thumbnail((780, 500), Image.Resampling.LANCZOS)
                 photo = ImageTk.PhotoImage(image=img)
 
@@ -551,7 +722,7 @@ class CameraManager:
                 preview_window.after(30, update_frame)
 
             update_frame()
-            info_label.config(text="Kamera-Test läuft – Fenster schließen zum Beenden")
+            info_label.config(text="Kamera-Test mit Live-Gesichtserkennung")
             preview_window.transient(self.parent_window)
             preview_window.grab_set()
             self.parent_window.wait_window(preview_window)

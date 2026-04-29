@@ -1,0 +1,23 @@
+#!/bin/bash
+# TuxGuard Launcher Wrapper
+# Dieses Skript wird während der Installation nach /usr/local/bin/tuxguard kopiert
+# und startet die TuxGuard-Anwendung im korrekten Verzeichnis mit Virtual Environment
+
+INSTALL_DIR="/opt/tuxguard"
+VENV_DIR="/opt/tuxguard/.venv"
+PYTHON_CMD="/usr/bin/python3"
+
+# Überprüfe, ob das Installationsverzeichnis existiert
+if [ ! -d "$INSTALL_DIR" ]; then
+    echo "Fehler: TuxGuard ist nicht installiert unter $INSTALL_DIR"
+    exit 1
+fi
+
+# Verwende Virtual Environment Python, falls vorhanden
+if [ -f "$VENV_DIR/bin/python" ]; then
+    PYTHON_CMD="$VENV_DIR/bin/python"
+fi
+
+# Starte die Anwendung im installierten Verzeichnis
+cd "$INSTALL_DIR"
+exec "$PYTHON_CMD" tuxguard.py "$@"

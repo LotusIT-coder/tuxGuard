@@ -14,6 +14,7 @@ rm -f /usr/share/applications/tuxguard.desktop
 
 # Entferne Programmdateien
 echo "Entferne Programmdateien..."
+rm -f /opt/tuxguard/master_credentials.json
 rm -rf /opt/tuxguard
 
 # Optional: Entferne Python-Pakete

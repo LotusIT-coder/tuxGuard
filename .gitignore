@@ -66,3 +66,12 @@ Thumbs.db
 *.tmp
 *.temp
 .cache/
+
+# TuxGuard - Sicherheitsrelevante Laufzeitdateien (NIE committen!)
+master_credentials.json
+**/master_credentials.json
+face_recognition.db
+*.keras
+
+# Agent/IDE
+.codex
