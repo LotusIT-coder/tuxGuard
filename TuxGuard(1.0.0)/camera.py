@@ -15,13 +15,14 @@ import traceback
 import logging
 import numpy as np
 from pathlib import Path
-from typing import Optional, Callable, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 from threading import Timer
 
 from face_mediapipe import (
     load_image_file,
     face_locations as mp_face_locations,
     face_encodings as mp_face_encodings,
+    face_emotions as mp_face_emotions,
     compare_faces,
     face_distance,
 )
@@ -67,6 +68,15 @@ class CameraManager:
         
         # Dialoge
         self.permission_dialog = None
+
+        # Emotions-Overlay (rein visuell, keine Persistenz)
+        self.emotion_overlay_enabled = bool(getattr(Config, "EMOTION_OVERLAY_ENABLED", True))
+        self.emotion_min_confidence = float(getattr(Config, "EMOTION_MIN_CONFIDENCE", 0.35))
+        self.emotion_smoothing_alpha = float(getattr(Config, "EMOTION_SMOOTHING_ALPHA", 0.35))
+        self.emotion_track_max_distance = float(getattr(Config, "EMOTION_TRACK_MAX_DISTANCE", 90.0))
+        self.emotion_track_ttl_seconds = float(getattr(Config, "EMOTION_TRACK_TTL_SECONDS", 1.5))
+        self._emotion_tracks: Dict[int, Dict[str, object]] = {}
+        self._next_emotion_track_id = 1
         
         # Callbacks
         self.user_recognized_callback: Optional[Callable[[str], None]] = None
@@ -93,6 +103,12 @@ class CameraManager:
         self.unauthorized_access_callback = unauthorized_access
         self.preview_updated_callback = preview_updated
         self.user_seen_callback = user_seen
+
+    def set_emotion_overlay_enabled(self, enabled: bool):
+        """Aktiviert/deaktiviert die Emotionsanzeige im Live-Overlay zur Laufzeit."""
+        self.emotion_overlay_enabled = bool(enabled)
+        self._emotion_tracks.clear()
+        logger.info("Emotions-Overlay %s", "aktiv" if self.emotion_overlay_enabled else "inaktiv")
     
     def _check_availability(self) -> bool:
         """Prüft, ob eine Kamera verfügbar ist"""
@@ -307,6 +323,8 @@ class CameraManager:
         self.last_state = None
         self.state_since = time.time()
         self.state_candidate = None
+        self._emotion_tracks.clear()
+        self._next_emotion_track_id = 1
         self.camera_after_id = self.parent_window.after(0, self._run_camera_step)
         
         logger.info("Kamera-Aufnahme gestartet")
@@ -332,6 +350,7 @@ class CameraManager:
         
         cv2.destroyAllWindows()
         self.stop_monitoring()
+        self._emotion_tracks.clear()
         
         logger.info("Kamera-Aufnahme gestoppt")
 
@@ -340,27 +359,33 @@ class CameraManager:
         frame: np.ndarray,
         face_locations: List[Tuple[int, int, int, int]],
         face_names: List[str],
+        face_emotions: Optional[List[Dict[str, object]]] = None,
     ) -> Image.Image:
         """Erstellt eine annotierte Vorschau für die Monitoring-UI."""
         preview_frame = frame.copy()
+        emotions = face_emotions or []
 
         for index, (top, right, bottom, left) in enumerate(face_locations):
             name = face_names[index] if index < len(face_names) else "Unbekannt"
+            emotion_text = self._format_emotion_label(
+                emotions[index] if index < len(emotions) else None
+            )
+            display_name = name if not emotion_text else f"{name} | {emotion_text}"
             color = (76, 175, 80) if name != "Unbekannt" else (255, 82, 82)
             cv2.rectangle(preview_frame, (left, top), (right, bottom), color, 2)
             cv2.rectangle(
                 preview_frame,
-                (left, max(bottom - 22, top)),
+                (left, max(bottom - 24, top)),
                 (right, bottom),
                 color,
                 cv2.FILLED,
             )
             cv2.putText(
                 preview_frame,
-                name,
-                (left + 4, max(bottom - 6, top + 14)),
+                display_name,
+                (left + 4, max(bottom - 7, top + 15)),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
+                0.45,
                 (0, 0, 0),
                 1,
             )
@@ -369,6 +394,128 @@ class CameraManager:
         image = Image.fromarray(display_rgb)
         image.thumbnail((360, 220), Image.Resampling.LANCZOS)
         return image
+
+    @staticmethod
+    def _bbox_center(box: Tuple[int, int, int, int]) -> Tuple[float, float]:
+        top, right, bottom, left = box
+        return ((left + right) / 2.0, (top + bottom) / 2.0)
+
+    @staticmethod
+    def _distance(a: Tuple[float, float], b: Tuple[float, float]) -> float:
+        return float(np.hypot(a[0] - b[0], a[1] - b[1]))
+
+    def _summarize_votes(self, votes: Dict[str, float]) -> Tuple[str, float]:
+        if not votes:
+            return "unknown", 0.0
+        filtered = {label: max(0.0, float(value)) for label, value in votes.items() if label != "unknown"}
+        if not filtered:
+            return "unknown", 0.0
+        total = float(sum(filtered.values()))
+        if total <= 1e-8:
+            return "unknown", 0.0
+        label, value = max(filtered.items(), key=lambda item: item[1])
+        confidence = float(max(0.0, min(1.0, value / total)))
+        if confidence < self.emotion_min_confidence:
+            return "unknown", confidence
+        return label, confidence
+
+    def _smooth_emotions(
+        self,
+        face_locations: List[Tuple[int, int, int, int]],
+        raw_emotions: List[Dict[str, object]],
+    ) -> List[Dict[str, object]]:
+        if not self.emotion_overlay_enabled:
+            return [{"label": "unknown", "confidence": 0.0, "source": "disabled"} for _ in face_locations]
+
+        now = time.time()
+        alpha = float(max(0.0, min(1.0, self.emotion_smoothing_alpha)))
+        ttl = float(max(0.1, self.emotion_track_ttl_seconds))
+        max_distance = float(max(10.0, self.emotion_track_max_distance))
+
+        stale_ids = [
+            track_id
+            for track_id, track in self._emotion_tracks.items()
+            if now - float(track.get("last_seen", 0.0)) > ttl
+        ]
+        for track_id in stale_ids:
+            self._emotion_tracks.pop(track_id, None)
+
+        used_track_ids = set()
+        smoothed: List[Dict[str, object]] = []
+
+        for index, box in enumerate(face_locations):
+            center = self._bbox_center(box)
+
+            selected_track_id = None
+            selected_distance = float("inf")
+            for track_id, track in self._emotion_tracks.items():
+                if track_id in used_track_ids:
+                    continue
+                track_center = track.get("center")
+                if not isinstance(track_center, tuple) or len(track_center) != 2:
+                    continue
+                dist = self._distance(center, track_center)
+                if dist <= max_distance and dist < selected_distance:
+                    selected_distance = dist
+                    selected_track_id = track_id
+
+            if selected_track_id is None:
+                selected_track_id = self._next_emotion_track_id
+                self._next_emotion_track_id += 1
+                self._emotion_tracks[selected_track_id] = {
+                    "center": center,
+                    "last_seen": now,
+                    "votes": {},
+                }
+
+            track = self._emotion_tracks[selected_track_id]
+            used_track_ids.add(selected_track_id)
+            track["center"] = center
+            track["last_seen"] = now
+
+            votes: Dict[str, float] = dict(track.get("votes", {}))
+            for label in list(votes.keys()):
+                votes[label] = float(votes[label]) * (1.0 - alpha)
+                if votes[label] < 1e-5:
+                    votes.pop(label, None)
+
+            raw = raw_emotions[index] if index < len(raw_emotions) else {}
+            label = str(raw.get("label", "unknown") or "unknown")
+            confidence = float(raw.get("confidence", 0.0) or 0.0)
+            if label != "unknown" and confidence > 0.0:
+                votes[label] = votes.get(label, 0.0) + alpha * confidence
+
+            track["votes"] = votes
+            smoothed_label, smoothed_confidence = self._summarize_votes(votes)
+            smoothed.append(
+                {
+                    "label": smoothed_label,
+                    "confidence": smoothed_confidence,
+                    "source": "smoothed",
+                }
+            )
+
+        return smoothed
+
+    def _format_emotion_label(self, emotion: Optional[Dict[str, object]]) -> str:
+        if not emotion:
+            return ""
+        label = str(emotion.get("label", "unknown") or "unknown")
+        confidence = float(emotion.get("confidence", 0.0) or 0.0)
+        if label == "unknown" or confidence < self.emotion_min_confidence:
+            return ""
+        german_labels = {
+            "happy": "Freude",
+            "sad": "Traurig",
+            "angry": "Wuetend",
+            "surprised": "Ueberrascht",
+            "fearful": "Aengstlich",
+            "disgusted": "Angeekelt",
+            "neutral": "Neutral",
+        }
+        label = german_labels.get(label, label)
+        percent = int(round(confidence * 100.0))
+        return f"{label} {percent}%"
     
     def _run_camera_step(self):
         """Verarbeitet einen Kamera-Schritt im Tk-Hauptthread."""
@@ -386,6 +533,12 @@ class CameraManager:
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             face_locations = mp_face_locations(rgb_frame)
             face_encodings = mp_face_encodings(rgb_frame, face_locations)
+            raw_emotions = (
+                mp_face_emotions(rgb_frame, min_confidence=self.emotion_min_confidence)
+                if self.emotion_overlay_enabled
+                else []
+            )
+            face_emotions = self._smooth_emotions(face_locations, raw_emotions)
 
             user_recognized = False
             recognized_user = None
@@ -427,7 +580,12 @@ class CameraManager:
                 preview_level = "WARNING"
 
             if self.preview_updated_callback:
-                preview_image = self._build_preview_image(frame, face_locations, face_names)
+                preview_image = self._build_preview_image(
+                    frame,
+                    face_locations,
+                    face_names,
+                    face_emotions=face_emotions,
+                )
                 self.preview_updated_callback(preview_image, preview_status, preview_level)
 
             # Heartbeat: jeder Frame mit legitimem Nutzer setzt den Sperr-Timer zurück,
@@ -673,6 +831,12 @@ class CameraManager:
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 face_locations = mp_face_locations(frame_rgb)
                 face_encodings = mp_face_encodings(frame_rgb, face_locations)
+                raw_emotions = (
+                    mp_face_emotions(frame_rgb, min_confidence=self.emotion_min_confidence)
+                    if self.emotion_overlay_enabled
+                    else []
+                )
+                face_emotions = self._smooth_emotions(face_locations, raw_emotions)
                 face_names = []
 
                 for face_encoding in face_encodings:
@@ -697,15 +861,19 @@ class CameraManager:
 
                 for index, (top, right, bottom, left) in enumerate(face_locations):
                     name = face_names[index] if index < len(face_names) else "Unbekannt"
+                    emotion_text = self._format_emotion_label(
+                        face_emotions[index] if index < len(face_emotions) else None
+                    )
+                    display_name = name if not emotion_text else f"{name} | {emotion_text}"
                     color = (76, 175, 80) if name != "Unbekannt" else (255, 82, 82)
                     cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
-                    cv2.rectangle(frame, (left, max(bottom - 22, top)), (right, bottom), color, cv2.FILLED)
+                    cv2.rectangle(frame, (left, max(bottom - 24, top)), (right, bottom), color, cv2.FILLED)
                     cv2.putText(
                         frame,
-                        name,
-                        (left + 4, max(bottom - 6, top + 14)),
+                        display_name,
+                        (left + 4, max(bottom - 7, top + 15)),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
+                        0.45,
                         (0, 0, 0),
                         1,
                     )

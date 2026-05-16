@@ -28,7 +28,7 @@ import sys
 import threading
 import urllib.request
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -57,6 +57,12 @@ _RIGHT_EYE_LANDMARKS = (362, 263, 386, 374, 380, 373)
 _NOSE_TIP_LANDMARK = 1
 _CHIN_LANDMARK = 152
 _FOREHEAD_LANDMARK = 10
+
+_EmotionDetection = Tuple[
+    Tuple[int, int, int, int],
+    Optional[object],
+    Optional[Dict[str, float]],
+]
 
 # ---------------------------------------------------------------------------
 # Haar-Cascades (Fallback)
@@ -207,7 +213,7 @@ def _ensure_landmarker():
                 min_face_detection_confidence=0.3,
                 min_face_presence_confidence=0.3,
                 min_tracking_confidence=0.3,
-                output_face_blendshapes=False,
+                output_face_blendshapes=True,
                 output_facial_transformation_matrixes=False,
             )
             _MP_LANDMARKER = mp_vision.FaceLandmarker.create_from_options(options)
@@ -267,7 +273,7 @@ def _bbox_from_landmarks(
 
 def _detect_with_mediapipe(
     image: np.ndarray,
-) -> List[Tuple[Tuple[int, int, int, int], Optional[object]]]:
+) -> List[_EmotionDetection]:
     """Liefert Liste aus (bbox, landmark_list_or_None)."""
     landmarker = _ensure_landmarker()
     if landmarker is None:
@@ -284,12 +290,23 @@ def _detect_with_mediapipe(
         return []
 
     height, width = image.shape[:2]
-    detections: List[Tuple[Tuple[int, int, int, int], Optional[object]]] = []
-    for landmarks in (result.face_landmarks or []):
+    detections: List[_EmotionDetection] = []
+    landmarks_list = list(result.face_landmarks or [])
+    blendshapes_list = list(result.face_blendshapes or [])
+    for index, landmarks in enumerate(landmarks_list):
         try:
             bbox = _bbox_from_landmarks(landmarks, width, height)
             if bbox[2] > bbox[0] and bbox[1] > bbox[3]:
-                detections.append((bbox, landmarks))
+                blendshape_scores: Dict[str, float] = {}
+                if index < len(blendshapes_list):
+                    categories = getattr(blendshapes_list[index], "categories", []) or []
+                    for category in categories:
+                        name = str(getattr(category, "category_name", "") or "").strip()
+                        if not name:
+                            continue
+                        score = float(getattr(category, "score", 0.0) or 0.0)
+                        blendshape_scores[name] = max(0.0, min(1.0, score))
+                detections.append((bbox, landmarks, blendshape_scores or None))
         except Exception as exc:  # pylint: disable=broad-except
             logger.debug("Landmark-Auswertung fehlgeschlagen: %s", exc)
     return detections
@@ -424,7 +441,7 @@ def _clip_box(
 # Pro-Frame-Cache: vermeidet doppelte Detektion, wenn der Aufrufer zuerst
 # face_locations() und danach face_encodings() für denselben Frame aufruft.
 _DETECTION_CACHE_KEY: Optional[Tuple[int, int, int, bytes]] = None
-_DETECTION_CACHE_VALUE: List[Tuple[Tuple[int, int, int, int], Optional[object]]] = []
+_DETECTION_CACHE_VALUE: List[_EmotionDetection] = []
 
 
 def _cache_key(image: np.ndarray) -> Tuple[int, int, int, bytes]:
@@ -437,7 +454,7 @@ def _cache_key(image: np.ndarray) -> Tuple[int, int, int, bytes]:
 
 def _detect_faces_with_landmarks(
     image: np.ndarray,
-) -> List[Tuple[Tuple[int, int, int, int], Optional[object]]]:
+) -> List[_EmotionDetection]:
     """Hauptdetektion. Liefert (bbox, landmarks_or_None) sortiert nach Größe."""
     global _DETECTION_CACHE_KEY, _DETECTION_CACHE_VALUE
 
@@ -458,10 +475,10 @@ def _detect_faces_with_landmarks(
     for box in cascade_boxes:
         if any(_box_overlap(box, existing) >= 0.4 for existing in mp_boxes):
             continue
-        detections.append((box, None))
+        detections.append((box, None, None))
 
     # Deduplizierung über alle Detektionen
-    deduped: List[Tuple[Tuple[int, int, int, int], Optional[object]]] = []
+    deduped: List[_EmotionDetection] = []
     for det in detections:
         if any(_box_overlap(det[0], existing[0]) >= 0.5 for existing in deduped):
             continue
@@ -581,7 +598,7 @@ def load_image_file(file_path: str) -> np.ndarray:
 
 def face_locations(image: np.ndarray) -> List[Tuple[int, int, int, int]]:
     """Liefert erkannte Gesichter als Tupel ``(top, right, bottom, left)``."""
-    return [bbox for bbox, _ in _detect_faces_with_landmarks(image)]
+    return [bbox for bbox, _, _ in _detect_faces_with_landmarks(image)]
 
 
 def face_encodings(
@@ -597,7 +614,7 @@ def face_encodings(
     """
     detections = _detect_faces_with_landmarks(image)
     encodings: List[np.ndarray] = []
-    for bbox, landmarks in detections:
+    for bbox, landmarks, _ in detections:
         aligned: Optional[np.ndarray] = None
         if landmarks is not None:
             aligned = _align_with_landmarks(image, landmarks)
@@ -637,6 +654,87 @@ def compare_faces(
     return [float(distance) <= tolerance for distance in distances]
 
 
+def _mean_score(scores: Dict[str, float], keys: Sequence[str]) -> float:
+    values = [float(scores.get(key, 0.0)) for key in keys]
+    if not values:
+        return 0.0
+    return float(sum(values) / len(values))
+
+
+def _infer_emotion_from_blendshapes(
+    scores: Optional[Dict[str, float]],
+    min_confidence: float,
+) -> Dict[str, object]:
+    """Leitet eine grobe Emotion aus FaceBlendshape-Scores ab."""
+    if not scores:
+        return {
+            "label": "unknown",
+            "confidence": 0.0,
+            "source": "none",
+            "scores": {},
+        }
+
+    emotion_scores = {
+        "happy": _mean_score(scores, (
+            "mouthSmileLeft", "mouthSmileRight", "cheekSquintLeft", "cheekSquintRight"
+        )),
+        "sad": _mean_score(scores, (
+            "browInnerUp", "mouthFrownLeft", "mouthFrownRight"
+        )),
+        "angry": _mean_score(scores, (
+            "browDownLeft", "browDownRight", "noseSneerLeft", "noseSneerRight", "jawForward"
+        )),
+        "surprised": _mean_score(scores, (
+            "jawOpen", "eyeWideLeft", "eyeWideRight", "browOuterUpLeft", "browOuterUpRight"
+        )),
+        "fearful": _mean_score(scores, (
+            "eyeWideLeft", "eyeWideRight", "mouthStretchLeft", "mouthStretchRight", "browInnerUp"
+        )),
+        "disgusted": _mean_score(scores, (
+            "noseSneerLeft", "noseSneerRight", "mouthUpperUpLeft", "mouthUpperUpRight"
+        )),
+        "neutral": 0.2,
+    }
+
+    total = float(sum(max(0.0, val) for val in emotion_scores.values()))
+    if total <= 1e-8:
+        return {
+            "label": "unknown",
+            "confidence": 0.0,
+            "source": "blendshape",
+            "scores": emotion_scores,
+        }
+
+    best_label, best_score = max(emotion_scores.items(), key=lambda item: item[1])
+    confidence = float(max(0.0, min(1.0, best_score / total)))
+    label = best_label if confidence >= min_confidence else "unknown"
+
+    return {
+        "label": label,
+        "confidence": confidence,
+        "source": "blendshape",
+        "scores": emotion_scores,
+    }
+
+
+def face_emotions(
+    image: np.ndarray,
+    min_confidence: float = 0.35,
+) -> List[Dict[str, object]]:
+    """Liefert pro erkanntem Gesicht eine grobe Emotionsschätzung.
+
+    Die Reihenfolge entspricht ``face_locations(image)``.
+    """
+    detections = _detect_faces_with_landmarks(image)
+    emotions: List[Dict[str, object]] = []
+    threshold = float(max(0.0, min(1.0, min_confidence)))
+    for bbox, _, blendshape_scores in detections:
+        result = _infer_emotion_from_blendshapes(blendshape_scores, threshold)
+        result["bbox"] = bbox
+        emotions.append(result)
+    return emotions
+
+
 def safe_face_encodings_from_file(file_path: str, timeout: int = 30) -> List[np.ndarray]:
     """Liest Gesichtskodierungen in einem separaten Prozess aus einer Bilddatei."""
     if not _WORKER_SCRIPT.exists():
@@ -674,6 +772,48 @@ def safe_face_encodings_from_file(file_path: str, timeout: int = 30) -> List[np.
         raise RuntimeError("Ungültige Antwort vom Gesichtserkennungs-Worker.") from exc
 
     return [np.array(encoding, dtype=np.float64) for encoding in payload.get("encodings", [])]
+
+
+def safe_face_analysis_from_file(file_path: str, timeout: int = 30) -> Dict[str, object]:
+    """Liefert Gesichtskodierungen plus optionale Emotionsschätzung aus Worker."""
+    if not _WORKER_SCRIPT.exists():
+        raise FileNotFoundError(f"Worker-Skript nicht gefunden: {_WORKER_SCRIPT}")
+
+    try:
+        result = subprocess.run(
+            [sys.executable, str(_WORKER_SCRIPT), file_path, "--with-emotions"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Gesichtsanalyse hat das Zeitlimit überschritten.") from exc
+
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+
+    if result.returncode != 0:
+        details = f"Worker beendet mit Code {result.returncode}"
+        if stdout:
+            try:
+                payload = json.loads(stdout)
+                details = payload.get("error", details)
+            except json.JSONDecodeError:
+                details = stdout.splitlines()[-1]
+        elif stderr:
+            details = stderr.splitlines()[-1]
+        raise RuntimeError(f"Gesichtsanalyse fehlgeschlagen: {details}")
+
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Ungültige Antwort vom Gesichtsanalyse-Worker.") from exc
+
+    return {
+        "encodings": [np.array(encoding, dtype=np.float64) for encoding in payload.get("encodings", [])],
+        "emotions": payload.get("emotions", []),
+    }
 
 
 def backend_info() -> dict:

@@ -281,6 +281,7 @@ class SimpleMainUI:
         self.monitor_preview_label = None
         self.monitor_preview_image = None
         self.monitor_preview_status_label = None
+        self.emotion_overlay_var = None
         
         self._setup_window()
         self._create_widgets()
@@ -363,6 +364,21 @@ class SimpleMainUI:
         )
         autostart_cb.pack(anchor="w", padx=10, pady=5)
 
+        self.emotion_overlay_var = tk.BooleanVar(
+            value=bool(getattr(Config, "EMOTION_OVERLAY_ENABLED", True))
+        )
+        emotion_cb = tk.Checkbutton(
+            autostart_frame,
+            text="Emotionen im Kamera-Overlay anzeigen",
+            variable=self.emotion_overlay_var,
+            command=self._on_emotion_overlay_changed,
+            bg=ModernColors.SURFACE,
+            fg=ModernColors.TEXT_PRIMARY,
+            selectcolor=ModernColors.SECONDARY_LIGHT,
+            font=("Arial", 10)
+        )
+        emotion_cb.pack(anchor="w", padx=10, pady=(0, 8))
+
         # Kamera-Kontrollen
         self._create_control_section(frame, "Kamera-Überwachung", [
             ("test_camera", "📷 Kamera testen", self._call_callback),
@@ -387,6 +403,16 @@ class SimpleMainUI:
     def set_autostart_state(self, enabled: bool):
         if hasattr(self, 'autostart_var'):
             self.autostart_var.set(enabled)
+
+    def _on_emotion_overlay_changed(self):
+        self._call_callback(
+            'emotion_overlay_changed',
+            bool(self.emotion_overlay_var.get()) if self.emotion_overlay_var is not None else False,
+        )
+
+    def set_emotion_overlay_state(self, enabled: bool):
+        if self.emotion_overlay_var is not None:
+            self.emotion_overlay_var.set(bool(enabled))
 
     def set_security_settings(self, mode: str, deadman_timeout: int, deadman_action: str):
         if self.security_mode_var is not None:

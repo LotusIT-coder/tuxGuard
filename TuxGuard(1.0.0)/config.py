@@ -52,6 +52,13 @@ class Config:
     # Adaptives Lernen
     ADAPTIVE_RETRAIN_INTERVAL = 10
     ADAPTIVE_POSITIVE_SAMPLES_MAX = 1000
+
+    # Emotionsanzeige (optional, nur Live-Overlay)
+    EMOTION_OVERLAY_ENABLED = True
+    EMOTION_MIN_CONFIDENCE = 0.35
+    EMOTION_SMOOTHING_ALPHA = 0.35
+    EMOTION_TRACK_MAX_DISTANCE = 90.0
+    EMOTION_TRACK_TTL_SECONDS = 1.5
     
     # Logging (relativ zum Installationsverzeichnis)
     LOGS_DIR = _SCRIPT_DIR / "logs"
