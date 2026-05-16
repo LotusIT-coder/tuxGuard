@@ -129,10 +129,6 @@ class TuxGuardApplication:
                 autostart_enabled = self._is_autostart_enabled()
                 if hasattr(self.ui, 'set_autostart_state'):
                     self.ui.set_autostart_state(autostart_enabled)
-                if hasattr(self.ui, 'set_emotion_overlay_state'):
-                    self.ui.set_emotion_overlay_state(Config.EMOTION_OVERLAY_ENABLED)
-                if self.camera_manager:
-                    self.camera_manager.set_emotion_overlay_enabled(Config.EMOTION_OVERLAY_ENABLED)
                 if hasattr(self.ui, 'autostart_callback'):
                     self.ui.autostart_callback = self._on_autostart_checkbox
                 # Autostart: Überwachungsmodus ggf. direkt aktivieren
@@ -398,7 +394,6 @@ class TuxGuardApplication:
         self.ui.set_callback('toggle_monitoring', self._toggle_monitoring)
         self.ui.set_callback('add_new_user', self._add_new_user)
         self.ui.set_callback('security_settings_changed', self._on_security_settings_changed)
-        self.ui.set_callback('emotion_overlay_changed', self._on_emotion_overlay_changed)
         
         # Kamera Callbacks
         self.camera_manager.set_callbacks(
@@ -406,6 +401,7 @@ class TuxGuardApplication:
             unauthorized_access=self._on_unauthorized_access,
             preview_updated=self._on_camera_preview_updated,
             user_seen=self._on_user_seen,
+            emotion_alert=self._on_emotion_alert,
         )
         
         # User List Callbacks
@@ -490,17 +486,6 @@ class TuxGuardApplication:
 
         if self.security_lock_active:
             self._update_security_lock_status()
-
-    def _on_emotion_overlay_changed(self, enabled: bool):
-        """Aktualisiert Emotionsanzeige zur Laufzeit."""
-        enabled = bool(enabled)
-        Config.EMOTION_OVERLAY_ENABLED = enabled
-        if self.camera_manager:
-            self.camera_manager.set_emotion_overlay_enabled(enabled)
-        if self.ui:
-            state = "aktiviert" if enabled else "deaktiviert"
-            self.ui.add_security_log(f"Emotionsanzeige {state}", "INFO")
-        self.logger.info("Emotionsanzeige %s", "aktiviert" if enabled else "deaktiviert")
 
     def _deadman_monitor_loop(self):
         """Überwacht Sperr- und Totmannschalter-Timeouts während der Überwachung."""
@@ -1115,6 +1100,31 @@ class TuxGuardApplication:
     def _on_unauthorized_access(self):
         """Wird thread-sicher auf den Tk-Hauptthread umgeleitet."""
         self.root.after(0, self._handle_unauthorized_access)
+
+    def _on_emotion_alert(self, emotion: str, duration_seconds: float):
+        """Wird thread-sicher auf den Tk-Hauptthread umgeleitet."""
+        self.root.after(0, lambda: self._handle_emotion_alert(emotion, duration_seconds))
+
+    def _handle_emotion_alert(self, emotion: str, duration_seconds: float):
+        labels = {
+            "angst": "Angst",
+            "panik": "Panik",
+            "unsicherheit": "Unsicherheit",
+            "nervositaet": "Nervositaet",
+        }
+        label = labels.get(emotion, emotion)
+        self.ui.add_security_log(
+            f"Kritische Emotion erkannt ({label}) seit {duration_seconds:.1f}s - Sperrbildschirm aktiviert",
+            "ERROR",
+        )
+        self.logger.warning(
+            "Kritische Emotion erkannt: %s seit %.2fs - Sperrbildschirm wird aktiviert",
+            label,
+            duration_seconds,
+        )
+        self._activate_security_lock(
+            f"Kritische Emotion erkannt ({label}) seit {duration_seconds:.1f}s"
+        )
 
     def _handle_unauthorized_access(self):
         """

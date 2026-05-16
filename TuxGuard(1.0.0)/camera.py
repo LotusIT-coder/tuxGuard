@@ -35,6 +35,12 @@ from database import DatabaseManager
 
 logger = logging.getLogger('TuxGuard.Camera')
 
+try:
+    import onnxruntime as ort
+    ONNXRUNTIME_AVAILABLE = True
+except ImportError:
+    ONNXRUNTIME_AVAILABLE = False
+
 class CameraError(Exception):
     """Benutzerdefinierte Exception für Kamerafehler"""
     pass
@@ -70,18 +76,31 @@ class CameraManager:
         self.permission_dialog = None
 
         # Emotions-Overlay (rein visuell, keine Persistenz)
-        self.emotion_overlay_enabled = bool(getattr(Config, "EMOTION_OVERLAY_ENABLED", True))
+        self.emotion_analysis_enabled = bool(getattr(Config, "EMOTION_ANALYSIS_ENABLED", True))
         self.emotion_min_confidence = float(getattr(Config, "EMOTION_MIN_CONFIDENCE", 0.35))
+        self.emotion_alert_min_confidence = float(getattr(Config, "EMOTION_ALERT_MIN_CONFIDENCE", 0.35))
+        self.emotion_alert_duration_seconds = float(getattr(Config, "EMOTION_ALERT_DURATION_SECONDS", 3.0))
         self.emotion_smoothing_alpha = float(getattr(Config, "EMOTION_SMOOTHING_ALPHA", 0.35))
         self.emotion_track_max_distance = float(getattr(Config, "EMOTION_TRACK_MAX_DISTANCE", 90.0))
         self.emotion_track_ttl_seconds = float(getattr(Config, "EMOTION_TRACK_TTL_SECONDS", 1.5))
         self._emotion_tracks: Dict[int, Dict[str, object]] = {}
         self._next_emotion_track_id = 1
+        self._emotion_alert_candidate: Optional[str] = None
+        self._emotion_alert_started_at: Optional[float] = None
+        self._emotion_alert_triggered = False
+
+        # Stufe 2: Emotion-Backend Initialisierung mit Fallback
+        self.emotion_backend = str(getattr(Config, "EMOTION_BACKEND", "blendshape")).lower()
+        self.emotion_onnx_model_path = getattr(Config, "EMOTION_ONNX_MODEL", None)
+        self.emotion_backend_fallback_enabled = bool(getattr(Config, "EMOTION_BACKEND_FALLBACK_ENABLED", True))
+        self._onnx_session = None
+        self._init_emotion_backend()
         
         # Callbacks
         self.user_recognized_callback: Optional[Callable[[str], None]] = None
         self.unauthorized_access_callback: Optional[Callable[[], None]] = None
         self.preview_updated_callback: Optional[Callable[[Image.Image, str, str], None]] = None
+        self.emotion_alert_callback: Optional[Callable[[str, float], None]] = None
         # Wird auf JEDEM Frame mit erkanntem legitimen Nutzer ausgelöst (kein Logging,
         # nur Heartbeat zum Zurücksetzen des Sperr-Timers).
         self.user_seen_callback: Optional[Callable[[str], None]] = None
@@ -92,7 +111,8 @@ class CameraManager:
     def set_callbacks(self, user_recognized: Optional[Callable[[str], None]] = None,
                      unauthorized_access: Optional[Callable[[], None]] = None,
                      preview_updated: Optional[Callable[[Image.Image, str, str], None]] = None,
-                     user_seen: Optional[Callable[[str], None]] = None):
+                     user_seen: Optional[Callable[[str], None]] = None,
+                     emotion_alert: Optional[Callable[[str, float], None]] = None):
         """Setzt Callback-Funktionen für Ereignisse.
 
         ``user_seen`` wird für jeden Frame ausgelöst, in dem ein legitimer Nutzer
@@ -103,13 +123,96 @@ class CameraManager:
         self.unauthorized_access_callback = unauthorized_access
         self.preview_updated_callback = preview_updated
         self.user_seen_callback = user_seen
+        self.emotion_alert_callback = emotion_alert
 
-    def set_emotion_overlay_enabled(self, enabled: bool):
-        """Aktiviert/deaktiviert die Emotionsanzeige im Live-Overlay zur Laufzeit."""
-        self.emotion_overlay_enabled = bool(enabled)
-        self._emotion_tracks.clear()
-        logger.info("Emotions-Overlay %s", "aktiv" if self.emotion_overlay_enabled else "inaktiv")
-    
+    def _init_emotion_backend(self) -> None:
+        """Initialisiert das gewählte Emotion-Backend mit Fallback-Strategie."""
+        if self.emotion_backend == "onnx":
+            if not ONNXRUNTIME_AVAILABLE:
+                logger.warning("onnxruntime nicht verfügbar; Fallback zu Blendshape")
+                self.emotion_backend = "blendshape"
+            elif self.emotion_onnx_model_path and Path(self.emotion_onnx_model_path).exists():
+                try:
+                    self._onnx_session = ort.InferenceSession(
+                        str(self.emotion_onnx_model_path),
+                        providers=['CPUExecutionProvider']
+                    )
+                    logger.info(f"ONNX Emotion-Modell geladen: {self.emotion_onnx_model_path}")
+                except Exception as exc:
+                    logger.warning(f"ONNX-Laden fehlgeschlagen: {exc}; Fallback zu Blendshape")
+                    self.emotion_backend = "blendshape"
+                    self._onnx_session = None
+            else:
+                if self.emotion_backend_fallback_enabled:
+                    logger.warning(f"ONNX-Modell nicht gefunden: {self.emotion_onnx_model_path}; Fallback zu Blendshape")
+                    self.emotion_backend = "blendshape"
+                else:
+                    logger.error(f"ONNX-Modell erforderlich aber nicht gefunden: {self.emotion_onnx_model_path}")
+                    self._onnx_session = None
+        
+        logger.info(f"Emotion-Backend aktiv: {self.emotion_backend}")
+
+    def _infer_emotions_via_backend(
+        self,
+        image: np.ndarray,
+        face_locations: List[Tuple[int, int, int, int]],
+    ) -> List[Dict[str, object]]:
+        """Inferiert Emotionen über das konfigurier Backend (ONNX oder Blendshape)."""
+        if self.emotion_backend == "onnx" and self._onnx_session:
+            return self._infer_emotions_onnx(image, face_locations)
+        else:
+            return self._infer_emotions_blendshape(image)
+
+    def _infer_emotions_blendshape(self, image: np.ndarray) -> List[Dict[str, object]]:
+        """Blendshape-basierte Emotion-Inferenz (aktuell implementiert)."""
+        return mp_face_emotions(image, min_confidence=self.emotion_min_confidence)
+
+    def _infer_emotions_onnx(
+        self,
+        image: np.ndarray,
+        face_locations: List[Tuple[int, int, int, int]],
+    ) -> List[Dict[str, object]]:
+        """ONNX FER-basierte Emotion-Inferenz."""
+        if not self._onnx_session:
+            return []
+        
+        emotions = []
+        for (top, right, bottom, left) in face_locations:
+            try:
+                face_crop = image[max(0, top):min(image.shape[0], bottom), 
+                                 max(0, left):min(image.shape[1], right)]
+                if face_crop.size == 0:
+                    emotions.append({"label": "unknown", "confidence": 0.0, "source": "onnx_error"})
+                    continue
+                
+                face_crop_resized = cv2.resize(face_crop, (224, 224))
+                face_crop_rgb = cv2.cvtColor(face_crop_resized, cv2.COLOR_BGR2RGB) if len(face_crop_resized.shape) == 3 else face_crop_resized
+                input_data = np.expand_dims(face_crop_rgb.astype(np.float32) / 255.0, 0)
+                
+                input_name = self._onnx_session.get_inputs()[0].name
+                output_name = self._onnx_session.get_outputs()[0].name
+                logits = self._onnx_session.run([output_name], {input_name: input_data})[0]
+                
+                emotion_labels = ["angry", "disgusted", "fearful", "happy", "neutral", "sad", "surprised"]
+                scores = dict(zip(emotion_labels, logits[0].tolist()))
+                best_label = max(scores, key=scores.get)
+                best_confidence = float(scores[best_label])
+                
+                if best_confidence >= self.emotion_min_confidence:
+                    emotions.append({
+                        "label": best_label,
+                        "confidence": best_confidence,
+                        "source": "onnx",
+                        "scores": scores,
+                    })
+                else:
+                    emotions.append({"label": "unknown", "confidence": 0.0, "source": "onnx"})
+            except Exception as exc:
+                logger.debug(f"ONNX-Inferenz für Face fehlgeschlagen: {exc}")
+                emotions.append({"label": "unknown", "confidence": 0.0, "source": "onnx_error"})
+        
+        return emotions
+
     def _check_availability(self) -> bool:
         """Prüft, ob eine Kamera verfügbar ist"""
         try:
@@ -325,6 +428,9 @@ class CameraManager:
         self.state_candidate = None
         self._emotion_tracks.clear()
         self._next_emotion_track_id = 1
+        self._emotion_alert_candidate = None
+        self._emotion_alert_started_at = None
+        self._emotion_alert_triggered = False
         self.camera_after_id = self.parent_window.after(0, self._run_camera_step)
         
         logger.info("Kamera-Aufnahme gestartet")
@@ -351,6 +457,9 @@ class CameraManager:
         cv2.destroyAllWindows()
         self.stop_monitoring()
         self._emotion_tracks.clear()
+        self._emotion_alert_candidate = None
+        self._emotion_alert_started_at = None
+        self._emotion_alert_triggered = False
         
         logger.info("Kamera-Aufnahme gestoppt")
 
@@ -361,34 +470,8 @@ class CameraManager:
         face_names: List[str],
         face_emotions: Optional[List[Dict[str, object]]] = None,
     ) -> Image.Image:
-        """Erstellt eine annotierte Vorschau für die Monitoring-UI."""
+        """Erstellt eine neutrale Vorschau ohne sichtbare Erkennungsdetails."""
         preview_frame = frame.copy()
-        emotions = face_emotions or []
-
-        for index, (top, right, bottom, left) in enumerate(face_locations):
-            name = face_names[index] if index < len(face_names) else "Unbekannt"
-            emotion_text = self._format_emotion_label(
-                emotions[index] if index < len(emotions) else None
-            )
-            display_name = name if not emotion_text else f"{name} | {emotion_text}"
-            color = (76, 175, 80) if name != "Unbekannt" else (255, 82, 82)
-            cv2.rectangle(preview_frame, (left, top), (right, bottom), color, 2)
-            cv2.rectangle(
-                preview_frame,
-                (left, max(bottom - 24, top)),
-                (right, bottom),
-                color,
-                cv2.FILLED,
-            )
-            cv2.putText(
-                preview_frame,
-                display_name,
-                (left + 4, max(bottom - 7, top + 15)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (0, 0, 0),
-                1,
-            )
 
         display_rgb = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(display_rgb)
@@ -424,7 +507,7 @@ class CameraManager:
         face_locations: List[Tuple[int, int, int, int]],
         raw_emotions: List[Dict[str, object]],
     ) -> List[Dict[str, object]]:
-        if not self.emotion_overlay_enabled:
+        if not self.emotion_analysis_enabled:
             return [{"label": "unknown", "confidence": 0.0, "source": "disabled"} for _ in face_locations]
 
         now = time.time()
@@ -516,6 +599,61 @@ class CameraManager:
         label = german_labels.get(label, label)
         percent = int(round(confidence * 100.0))
         return f"{label} {percent}%"
+
+    def _detect_critical_emotion(
+        self,
+        raw_emotions: List[Dict[str, object]],
+        smoothed_emotions: List[Dict[str, object]],
+    ) -> Optional[str]:
+        """Erkennt kritische Zustände aus Emotionsdaten.
+
+        Rückgabe ist einer der Zielzustände ``angst``, ``panik``,
+        ``unsicherheit`` oder ``nervositaet``.
+        """
+        for idx, smoothed in enumerate(smoothed_emotions):
+            raw = raw_emotions[idx] if idx < len(raw_emotions) else {}
+            label = str(smoothed.get("label", "unknown") or "unknown")
+            confidence = float(smoothed.get("confidence", 0.0) or 0.0)
+            scores = raw.get("scores", {}) if isinstance(raw, dict) else {}
+            fear_score = float(scores.get("fearful", 0.0) or 0.0)
+            surprise_score = float(scores.get("surprised", 0.0) or 0.0)
+
+            if (label == "fearful" and confidence >= 0.55) or (fear_score >= 0.55 and surprise_score >= 0.35):
+                return "panik"
+            if label == "fearful" and confidence >= self.emotion_alert_min_confidence:
+                return "angst"
+            if fear_score >= 0.30 and surprise_score >= 0.25:
+                return "nervositaet"
+            if (label in {"sad", "fearful", "unknown"} and confidence >= self.emotion_alert_min_confidence):
+                return "unsicherheit"
+        return None
+
+    def _handle_emotion_alert_timer(self, critical_emotion: Optional[str]) -> None:
+        """Loest nach anhaltender kritischer Emotion den Alarm-Callback aus."""
+        now = time.time()
+        if not critical_emotion:
+            self._emotion_alert_candidate = None
+            self._emotion_alert_started_at = None
+            self._emotion_alert_triggered = False
+            return
+
+        if self._emotion_alert_candidate != critical_emotion:
+            self._emotion_alert_candidate = critical_emotion
+            self._emotion_alert_started_at = now
+            self._emotion_alert_triggered = False
+            return
+
+        if self._emotion_alert_triggered or self._emotion_alert_started_at is None:
+            return
+
+        elapsed = now - self._emotion_alert_started_at
+        if elapsed >= max(0.5, self.emotion_alert_duration_seconds):
+            self._emotion_alert_triggered = True
+            if self.emotion_alert_callback:
+                try:
+                    self.emotion_alert_callback(critical_emotion, elapsed)
+                except Exception as cb_exc:
+                    logger.debug("emotion_alert_callback fehlgeschlagen: %s", cb_exc)
     
     def _run_camera_step(self):
         """Verarbeitet einen Kamera-Schritt im Tk-Hauptthread."""
@@ -534,11 +672,13 @@ class CameraManager:
             face_locations = mp_face_locations(rgb_frame)
             face_encodings = mp_face_encodings(rgb_frame, face_locations)
             raw_emotions = (
-                mp_face_emotions(rgb_frame, min_confidence=self.emotion_min_confidence)
-                if self.emotion_overlay_enabled
+                self._infer_emotions_via_backend(rgb_frame, face_locations)
+                if self.emotion_analysis_enabled
                 else []
             )
             face_emotions = self._smooth_emotions(face_locations, raw_emotions)
+            critical_emotion = self._detect_critical_emotion(raw_emotions, face_emotions)
+            self._handle_emotion_alert_timer(critical_emotion)
 
             user_recognized = False
             recognized_user = None
@@ -566,18 +706,11 @@ class CameraManager:
             grace_period = 1.0
 
             if face_locations:
-                if user_recognized and recognized_user:
-                    preview_status = f"Legitimer Nutzer erkannt: {recognized_user}"
-                    preview_level = "SUCCESS"
-                elif face_names:
-                    preview_status = "Gesicht erkannt: Unbekannt"
-                    preview_level = "ERROR"
-                else:
-                    preview_status = "Gesicht erkannt"
-                    preview_level = "INFO"
+                preview_status = "Ueberwachung aktiv"
+                preview_level = "INFO"
             else:
-                preview_status = "Kein Gesicht erkannt"
-                preview_level = "WARNING"
+                preview_status = "Ueberwachung aktiv"
+                preview_level = "INFO"
 
             if self.preview_updated_callback:
                 preview_image = self._build_preview_image(
@@ -825,15 +958,15 @@ class CameraManager:
                     preview_window.after(100, update_frame)
                     return
 
-                detection_text = "Kein Gesicht erkannt"
-                detection_color = "#ff9800"
+                detection_text = "Kamerasignal aktiv"
+                detection_color = "#4caf50"
 
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 face_locations = mp_face_locations(frame_rgb)
                 face_encodings = mp_face_encodings(frame_rgb, face_locations)
                 raw_emotions = (
-                    mp_face_emotions(frame_rgb, min_confidence=self.emotion_min_confidence)
-                    if self.emotion_overlay_enabled
+                    self._infer_emotions_via_backend(frame_rgb, face_locations)
+                    if self.emotion_analysis_enabled
                     else []
                 )
                 face_emotions = self._smooth_emotions(face_locations, raw_emotions)
@@ -849,34 +982,6 @@ class CameraManager:
                             if matches[best_match_index]:
                                 name = known_names[best_match_index]
                     face_names.append(name)
-
-                if face_locations:
-                    if any(name != "Unbekannt" for name in face_names):
-                        recognized = sorted({name for name in face_names if name != "Unbekannt"})
-                        detection_text = f"Erkannt: {', '.join(recognized)}"
-                        detection_color = "#4caf50"
-                    elif face_names:
-                        detection_text = "Gesicht erkannt: Unbekannt"
-                        detection_color = "#ff5252"
-
-                for index, (top, right, bottom, left) in enumerate(face_locations):
-                    name = face_names[index] if index < len(face_names) else "Unbekannt"
-                    emotion_text = self._format_emotion_label(
-                        face_emotions[index] if index < len(face_emotions) else None
-                    )
-                    display_name = name if not emotion_text else f"{name} | {emotion_text}"
-                    color = (76, 175, 80) if name != "Unbekannt" else (255, 82, 82)
-                    cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
-                    cv2.rectangle(frame, (left, max(bottom - 24, top)), (right, bottom), color, cv2.FILLED)
-                    cv2.putText(
-                        frame,
-                        display_name,
-                        (left + 4, max(bottom - 7, top + 15)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.45,
-                        (0, 0, 0),
-                        1,
-                    )
 
                 display_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 img = Image.fromarray(display_rgb)

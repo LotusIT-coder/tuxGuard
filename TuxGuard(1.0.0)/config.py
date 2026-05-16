@@ -53,12 +53,21 @@ class Config:
     ADAPTIVE_RETRAIN_INTERVAL = 10
     ADAPTIVE_POSITIVE_SAMPLES_MAX = 1000
 
-    # Emotionsanzeige (optional, nur Live-Overlay)
-    EMOTION_OVERLAY_ENABLED = True
+    # Emotionsanalyse (intern, ohne sichtbare UI-Anzeige)
     EMOTION_MIN_CONFIDENCE = 0.35
     EMOTION_SMOOTHING_ALPHA = 0.35
     EMOTION_TRACK_MAX_DISTANCE = 90.0
     EMOTION_TRACK_TTL_SECONDS = 1.5
+
+    # Stufe 2: Dediziertes Emotion-Backend (blendshape oder onnx)
+    EMOTION_BACKEND = "blendshape"  # "blendshape" oder "onnx" (ONNX=optional mit Fallback)
+    EMOTION_ONNX_MODEL = MODELS_DIR / "emotion_fer_onnx.onnx"  # Optional FER-Modell
+    EMOTION_BACKEND_FALLBACK_ENABLED = True  # Fallback zu Blendshape wenn ONNX fehlt
+
+    # Emotionale Risikoerkennung waehrend aktiver Ueberwachung
+    EMOTION_ANALYSIS_ENABLED = True
+    EMOTION_ALERT_DURATION_SECONDS = 3.0
+    EMOTION_ALERT_MIN_CONFIDENCE = 0.35
     
     # Logging (relativ zum Installationsverzeichnis)
     LOGS_DIR = _SCRIPT_DIR / "logs"
