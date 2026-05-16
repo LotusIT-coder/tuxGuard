@@ -976,6 +976,47 @@ class CameraManager:
                 face_emotions = self._smooth_emotions(face_locations, raw_emotions)
                 face_names = []
 
+                def _format_test_emotion(raw_emotion: Optional[Dict[str, object]],
+                                         smoothed_emotion: Optional[Dict[str, object]]) -> str:
+                    german_labels = {
+                        "happy": "Freude",
+                        "sad": "Traurig",
+                        "angry": "Wuetend",
+                        "surprised": "Ueberrascht",
+                        "fearful": "Aengstlich",
+                        "disgusted": "Angeekelt",
+                        "neutral": "Neutral",
+                        "unknown": "Unbekannt",
+                    }
+
+                    candidates = [raw_emotion or {}, smoothed_emotion or {}]
+                    selected_label = "unknown"
+                    selected_confidence = 0.0
+
+                    for candidate in candidates:
+                        label = str(candidate.get("label", "unknown") or "unknown")
+                        confidence = float(candidate.get("confidence", 0.0) or 0.0)
+                        if label != "unknown" and confidence > 0.0:
+                            selected_label = label
+                            selected_confidence = confidence
+                            break
+                        if confidence > selected_confidence:
+                            selected_label = label
+                            selected_confidence = confidence
+
+                    label_text = german_labels.get(selected_label, selected_label)
+                    percent = int(round(max(0.0, min(1.0, selected_confidence)) * 100.0))
+                    return f"{label_text} {percent}%"
+
+                # Emotionen für Statuszeile im Testmodus sammeln (immer inkl. Konfidenz)
+                emotion_texts = []
+                for idx in range(len(face_locations)):
+                    raw_emotion = raw_emotions[idx] if idx < len(raw_emotions) else {}
+                    smoothed_emotion = face_emotions[idx] if idx < len(face_emotions) else {}
+                    emotion_texts.append(
+                        f"Gesicht {idx+1}: {_format_test_emotion(raw_emotion, smoothed_emotion)}"
+                    )
+
                 for face_encoding in face_encodings:
                     name = "Unbekannt"
                     if known_encodings:
@@ -987,14 +1028,60 @@ class CameraManager:
                                 name = known_names[best_match_index]
                     face_names.append(name)
 
-                display_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # Sichtbare Erkennung nur im Testmodus: Box + Name + Emotion
+                preview_frame = frame.copy()
+                for idx, (top, right, bottom, left) in enumerate(face_locations):
+                    name = face_names[idx] if idx < len(face_names) else "Unbekannt"
+                    emotion_label = _format_test_emotion(
+                        raw_emotions[idx] if idx < len(raw_emotions) else None,
+                        face_emotions[idx] if idx < len(face_emotions) else None,
+                    )
+
+                    box_color = (76, 175, 80) if name != "Unbekannt" else (255, 82, 82)
+                    cv2.rectangle(preview_frame, (left, top), (right, bottom), box_color, 2)
+
+                    primary_label = f"Name: {name}"
+                    cv2.putText(
+                        preview_frame,
+                        primary_label,
+                        (left, max(20, top - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        box_color,
+                        2,
+                        cv2.LINE_AA,
+                    )
+
+                    if emotion_label:
+                        cv2.putText(
+                            preview_frame,
+                            emotion_label,
+                            (left, min(preview_frame.shape[0] - 10, bottom + 20)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (255, 255, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
+
+                if face_locations:
+                    detection_text = f"Gesicht erkannt ({len(face_locations)})"
+                    detection_color = "#4caf50"
+                else:
+                    detection_text = "Kein Gesicht erkannt"
+                    detection_color = "#ff5252"
+
+                display_rgb = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
                 img = Image.fromarray(display_rgb)
                 img.thumbnail((780, 500), Image.Resampling.LANCZOS)
                 photo = ImageTk.PhotoImage(image=img)
 
                 canvas.configure(image=photo)
                 canvas.image = photo
-                status_label.config(text=detection_text, fg=detection_color)
+                if emotion_texts:
+                    status_label.config(text=detection_text + " | " + ", ".join(emotion_texts), fg=detection_color)
+                else:
+                    status_label.config(text=detection_text, fg=detection_color)
 
                 preview_window.after(30, update_frame)
 
