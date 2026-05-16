@@ -135,7 +135,7 @@ class DatabaseManager:
             self.cursor.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
         if "is_admin" not in columns:
             self.cursor.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
-    
+
     def get_thread_connection(self) -> Tuple[sqlite3.Connection, sqlite3.Cursor]:
         """Erstellt eine neue Datenbankverbindung für Thread-Sicherheit"""
         conn = sqlite3.connect(str(self.db_path))

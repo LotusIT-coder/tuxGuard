@@ -13,7 +13,7 @@ import os
 import logging
 import io
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional, List
 
 import tkinter as tk
 from tkinter import messagebox, simpledialog, filedialog, ttk
@@ -40,11 +40,6 @@ from simple_ui import (
     show_recovery_code,
 )
 from auth import MasterAuth, MasterAuthError
-from mouse_monitor import (
-    load_pattern_model, verify_mouse_pattern,
-    start_mouse_monitoring, stop_mouse_monitoring,
-    train_mouse_pattern, set_mouse_monitoring_callback
-)
 
 
 class UILogHandler(logging.Handler):
@@ -88,10 +83,7 @@ class TuxGuardApplication:
         # Status
         self.monitoring_active = False
         self.session_start = time.time()
-        self.pattern_model = None
-        self.pattern_training_thread = None
         self.ui_log_handler = None
-        self.mouse_monitoring_enabled = False
         self.security_mode = Config.SECURITY_MODE
         self.security_lock_delay_seconds = Config.SECURITY_LOCK_DELAY_SECONDS
         self.deadman_timeout_seconds = Config.DEADMAN_TIMEOUT_SECONDS
@@ -376,13 +368,9 @@ class TuxGuardApplication:
             self.ui = MainUI(self.root)
             self.logger.info("Benutzeroberfläche initialisiert")
             
-            # Mustererkennungsmodell laden
-            self._load_pattern_model()
-            
             # Status aktualisieren
             self.ui.update_status(
-                camera_available=self.camera_manager.is_available,
-                mouse_available=self.pattern_model is not None
+                camera_available=self.camera_manager.is_available
             )
             
             # Kamera-Buttons konfigurieren
@@ -403,7 +391,6 @@ class TuxGuardApplication:
         # UI Callbacks
         self.ui.set_callback('test_camera', self._test_camera)
         self.ui.set_callback('diagnose_camera', self._diagnose_camera)
-        self.ui.set_callback('train_pattern', self._train_pattern)
         self.ui.set_callback('toggle_monitoring', self._toggle_monitoring)
         self.ui.set_callback('add_new_user', self._add_new_user)
         self.ui.set_callback('security_settings_changed', self._on_security_settings_changed)
@@ -415,9 +402,6 @@ class TuxGuardApplication:
             preview_updated=self._on_camera_preview_updated,
             user_seen=self._on_user_seen,
         )
-        
-        # Mausüberwachung Callback
-        set_mouse_monitoring_callback(self._on_mouse_verification_failed)
         
         # User List Callbacks
         self.ui.user_list_widget.set_callbacks(
@@ -524,7 +508,7 @@ class TuxGuardApplication:
         import subprocess as sp
 
         action_label = "Bereitschaftsmodus" if self.deadman_action == "suspend" else "Herunterfahren"
-        self.ui.add_mouse_log(f"Totmannschalter ausgelöst: {action_label}", "WARNING")
+        self.ui.add_security_log(f"Totmannschalter ausgelöst: {action_label}", "WARNING")
         self.logger.warning("Totmannschalter ausgelöst: %s", action_label)
 
         try:
@@ -698,7 +682,7 @@ class TuxGuardApplication:
         self.strict_unlock_prompt_active = False
         self.security_lock_unlock_pending = False
         if user_name:
-            self.ui.add_mouse_log(f"Sperrbildschirm aufgehoben: {user_name}", "SUCCESS")
+            self.ui.add_security_log(f"Sperrbildschirm aufgehoben: {user_name}", "SUCCESS")
             self.logger.info("Sperrbildschirm aufgehoben durch legitimen Nutzer: %s", user_name)
 
     def _prompt_strict_unlock(self, user_name: Optional[str]):
@@ -730,7 +714,7 @@ class TuxGuardApplication:
                 self.deadman_triggered = False
                 self._release_security_lock(user_name)
             else:
-                self.ui.add_mouse_log("PIN für Strict-Mode war falsch", "ERROR")
+                self.ui.add_security_log("PIN für Strict-Mode war falsch", "ERROR")
                 self.logger.warning("Strict-Mode-Entsperrung mit falscher PIN")
         finally:
             self.strict_unlock_prompt_active = False
@@ -745,33 +729,6 @@ class TuxGuardApplication:
             self._release_security_lock(user_name)
         finally:
             self.security_lock_unlock_pending = False
-    
-    def _set_train_button_enabled(self, enabled: bool):
-        """Aktiviert oder deaktiviert den Trainings-Button in der UI."""
-        if not self.ui:
-            return
-        button = self.ui.control_buttons.get('train_pattern')
-        if not button:
-            return
-        state = tk.NORMAL if enabled else tk.DISABLED
-        self.root.after(0, lambda: button.config(state=state))
-
-    def _load_pattern_model(self):
-        """Lädt das Mustererkennungsmodell"""
-        try:
-            if Config.MOUSE_PATTERN_MODEL.exists():
-                self.pattern_model = load_pattern_model()
-                if self.pattern_model:
-                    self.logger.info("Mustererkennungsmodell geladen")
-                    self.logger.warning(
-                        "Mausüberwachung bleibt im Stabilitätsmodus vorerst deaktiviert"
-                    )
-                else:
-                    self.logger.warning("Mustererkennungsmodell konnte nicht geladen werden")
-            else:
-                self.logger.info("Kein Mustererkennungsmodell gefunden")
-        except Exception as e:
-            self.logger.error(f"Fehler beim Laden des Mustererkennungsmodells: {e}")
     
     def _refresh_user_list(self):
         """Aktualisiert die Benutzerliste"""
@@ -792,71 +749,6 @@ class TuxGuardApplication:
         """Führt Kamera-Diagnose durch"""
         diagnosis = self.camera_manager.diagnose()
         messagebox.showinfo("Kamera-Diagnose", diagnosis)
-    
-    def _train_pattern(self):
-        """Startet das Training der Mausbewegungsmuster im Hintergrund."""
-        if self.pattern_training_thread and self.pattern_training_thread.is_alive():
-            messagebox.showinfo("Training läuft", "Das Muster-Training wird bereits ausgeführt.")
-            return
-
-        if not messagebox.askokcancel(
-            "Mausbewegungen trainieren",
-            "Während des Trainings werden Ihre aktuellen Mausbewegungen aufgezeichnet.\n"
-            "Bitte bewegen Sie die Maus in Ihrem üblichen Arbeitsmuster."
-        ):
-            return
-
-        self.ui.add_mouse_log("Muster-Training gestartet", "INFO")
-        self._set_train_button_enabled(False)
-
-        self.pattern_training_thread = threading.Thread(
-            target=self._run_pattern_training,
-            daemon=True,
-            name="MousePatternTraining"
-        )
-        self.pattern_training_thread.start()
-
-    def _run_pattern_training(self):
-        """Führt das Mausmuster-Training aus und aktualisiert UI sowie Status."""
-
-        def log_to_ui(message: str, level: str = "INFO"):
-            self.root.after(0, lambda: self.ui.add_mouse_log(message, level))
-
-        def report_progress(epoch: int, total: int, metrics: Dict[str, float]):
-            parts = [f"Epoche {epoch}/{total}"]
-            if metrics:
-                metric_parts = [f"{key}: {value:.4f}" for key, value in metrics.items() if isinstance(value, (int, float))]
-                if metric_parts:
-                    parts.append(", ".join(metric_parts))
-            log_to_ui(f"Training – {' | '.join(parts)}")
-
-        try:
-            result = train_mouse_pattern(
-                duration=Config.MOUSE_TRAINING_DURATION,
-                epochs=Config.MOUSE_TRAINING_EPOCHS,
-                batch_size=Config.MOUSE_TRAINING_BATCH_SIZE,
-                log_callback=log_to_ui,
-                progress_callback=report_progress
-            )
-
-            self.logger.info("Muster-Training erfolgreich abgeschlossen: %s", result)
-            self.pattern_model = load_pattern_model(force_reload=True)
-
-            self.root.after(0, lambda: self.ui.update_status(mouse_available=self.pattern_model is not None))
-            log_to_ui("Muster-Training erfolgreich abgeschlossen", "SUCCESS")
-            self.root.after(0, lambda: messagebox.showinfo(
-                "Training abgeschlossen",
-                "Das Mausmuster-Modell wurde erfolgreich trainiert und gespeichert."
-            ))
-
-        except Exception as exc:
-            self.logger.error("Muster-Training fehlgeschlagen: %s", exc, exc_info=True)
-            log_to_ui(f"Training fehlgeschlagen: {exc}", "ERROR")
-            self.root.after(0, lambda: messagebox.showerror("Training fehlgeschlagen", str(exc)))
-
-        finally:
-            self.pattern_training_thread = None
-            self._set_train_button_enabled(True)
     
     def _toggle_monitoring(self):
         """Schaltet Überwachung ein/aus"""
@@ -1195,7 +1087,7 @@ class TuxGuardApplication:
         """
         self.last_authorized_seen_at = time.time()
         self.deadman_triggered = False
-        self.ui.add_mouse_log(f"Benutzer erkannt: {user_name}")
+        self.ui.add_security_log(f"Benutzer erkannt: {user_name}")
         self.logger.info(f"Autorisierter Zugriff: {user_name}")
         if (
             self.security_lock_active
@@ -1215,10 +1107,10 @@ class TuxGuardApplication:
         - Kamera abgedeckt (kein Gesicht erkannt)
         """
         if self.security_mode == "deadman":
-            self.ui.add_mouse_log("Unbekannt oder kein Nutzer erkannt - Totmannschalter-Timer läuft", "WARNING")
+            self.ui.add_security_log("Unbekannt oder kein Nutzer erkannt - Totmannschalter-Timer läuft", "WARNING")
             self.logger.warning("Unbekannt oder kein Nutzer erkannt - Totmannschalter-Timer läuft weiter")
         else:
-            self.ui.add_mouse_log(
+            self.ui.add_security_log(
                 f"Unbekannt oder kein Nutzer erkannt - Sperre nach {self.security_lock_delay_seconds}s ohne legitime Erkennung",
                 "WARNING",
             )
@@ -1226,20 +1118,6 @@ class TuxGuardApplication:
                 "Unbekannt oder kein Nutzer erkannt - Sperre erfolgt nach %ss ohne legitimen Nutzer",
                 self.security_lock_delay_seconds,
             )
-    
-    def _on_mouse_verification_failed(self):
-        """Wird thread-sicher auf den Tk-Hauptthread umgeleitet."""
-        self.root.after(0, self._handle_mouse_verification_failed)
-
-    def _handle_mouse_verification_failed(self):
-        """
-        Wird aufgerufen wenn Mausmuster-Verifikation fehlschlägt.
-        Dies deutet auf unautorisierten Zugriff hin (fremde Person am System).
-        """
-        self.ui.add_mouse_log("⚠️ SICHERHEITSALARM: Mausmuster nicht erkannt!")
-        self.logger.warning("Mausmuster-Verifikation fehlgeschlagen - Sicherheitsmaßnahmen werden eingeleitet")
-        if self.security_mode != "deadman":
-            self._activate_security_lock("Mausmuster: Verifikation fehlgeschlagen")
     
     # Überwachungsfunktionen
     def _start_monitoring(self):
@@ -1253,19 +1131,9 @@ class TuxGuardApplication:
             # Kamera starten
             if self.camera_manager.is_available:
                 if self.camera_manager.start():
-                    self.ui.add_mouse_log("Kamera-Überwachung gestartet")
+                    self.ui.add_security_log("Kamera-Überwachung gestartet")
                 else:
-                    self.ui.add_mouse_log("Kamera-Start fehlgeschlagen")
-            
-            # Mausüberwachung starten
-            if self.pattern_model and self.mouse_monitoring_enabled:
-                start_mouse_monitoring()
-                self.ui.add_mouse_log("Maus-Überwachung gestartet")
-            elif self.pattern_model and not self.mouse_monitoring_enabled:
-                self.ui.add_mouse_log(
-                    "Maus-Überwachung ist wegen Stabilitätsproblemen vorübergehend deaktiviert",
-                    "WARNING",
-                )
+                    self.ui.add_security_log("Kamera-Start fehlgeschlagen")
 
             if self.deadman_thread is None or not self.deadman_thread.is_alive():
                 self.deadman_thread = threading.Thread(
@@ -1275,7 +1143,7 @@ class TuxGuardApplication:
                 )
                 self.deadman_thread.start()
             
-            self.ui.add_mouse_log("Überwachung gestartet")
+            self.ui.add_security_log("Überwachung gestartet")
             self.ui.update_monitoring_button(True)
 
             self.logger.info("Überwachung gestartet")
@@ -1293,12 +1161,10 @@ class TuxGuardApplication:
             # Kamera stoppen
             self.camera_manager.stop()
             
-            # Mausüberwachung stoppen
-            stop_mouse_monitoring()
             if self.security_lock_active:
                 self._release_security_lock()
 
-            self.ui.add_mouse_log("Überwachung gestoppt")
+            self.ui.add_security_log("Überwachung gestoppt")
             self.ui.update_monitoring_button(False)
             self.ui.clear_monitor_preview()
             

@@ -45,20 +45,9 @@ class Config:
     CAMERA_RETRY_ATTEMPTS = 3
     CAMERA_RETRY_DELAY = 1  # Sekunden
     
-    # Mausüberwachung
-    MOUSE_MONITOR_INTERVAL = 5  # Sekunden
-    MOUSE_DATA_COLLECTION_DURATION = 10  # Sekunden
-    MOUSE_TRAINING_DURATION = 15  # Sekunden für aktives Training
-    MOUSE_TRAINING_EPOCHS = 6
-    MOUSE_TRAINING_BATCH_SIZE = 64
-    MOUSE_MIN_TRAINING_SAMPLES = 80
-    MOUSE_VERIFICATION_THRESHOLD = 0.6
-    
     # Modell-Pfade (relativ zum Installationsverzeichnis)
     MODELS_DIR = _SCRIPT_DIR / "models"
     FACE_LANDMARKER_MODEL = MODELS_DIR / "face_landmarker_v2.task"
-    MOUSE_PATTERN_MODEL = MODELS_DIR / "mouse_pattern_model.keras"
-    MOUSE_PATTERN_NEGATIVES = MODELS_DIR / "mouse_pattern_negatives.npy"
     
     # Adaptives Lernen
     ADAPTIVE_RETRAIN_INTERVAL = 10

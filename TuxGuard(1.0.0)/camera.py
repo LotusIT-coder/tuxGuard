@@ -279,7 +279,7 @@ class CameraManager:
         if not self.is_available:
             messagebox.showinfo(
                 "Kamera nicht verfügbar",
-                "Keine Kamera verfügbar.\nNur die Mausbewegungserkennung ist aktiv."
+                "Keine Kamera verfügbar."
             )
             return False
         

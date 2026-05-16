@@ -272,7 +272,7 @@ class SimpleMainUI:
         self.control_buttons = {}
         self.status_indicators = {}
         self.user_list_widget = None
-        self.mouse_log_widget = None
+        self.security_log_widget = None
         self.security_mode_var = None
         self.deadman_timeout_var = None
         self.deadman_action_var = None
@@ -330,7 +330,7 @@ class SimpleMainUI:
         status_container = Frame(status_frame, bg=ModernColors.SURFACE, padx=10, pady=5)
         status_container.pack()
         
-        for key, label in [("camera", "[CAM]"), ("mouse", "[MSE]"), ("monitoring", "[MON]")]:
+        for key, label in [("camera", "[CAM]"), ("monitoring", "[MON]")]:
             frame = Frame(status_container, bg=ModernColors.SURFACE)
             frame.pack(side=tk.LEFT, padx=5)
             
@@ -369,11 +369,6 @@ class SimpleMainUI:
             ("diagnose_camera", "🔍 Kamera-Diagnose", self._call_callback)
         ])
 
-        # Muster-Erkennung
-        self._create_control_section(frame, "Muster-Erkennung", [
-            ("train_pattern", "🎯 Mausbewegungen trainieren", self._call_callback)
-        ])
-
         # Überwachung
         self._create_control_section(frame, "System-Überwachung", [
             ("toggle_monitoring", "▶️ Überwachung starten", self._call_callback)
@@ -383,7 +378,7 @@ class SimpleMainUI:
         self._create_security_settings_section(frame)
 
         # Log-Widget
-        self.mouse_log_widget = SimpleLogWidget(frame, "🖱️ Maus-Aktivitäten")
+        self.security_log_widget = SimpleLogWidget(frame, "🔐 Sicherheitsereignisse")
 
     def _on_autostart_changed(self):
         if hasattr(self, 'autostart_callback') and callable(self.autostart_callback):
@@ -590,13 +585,10 @@ class SimpleMainUI:
         if 'toggle_monitoring' in self.control_buttons:
             self.control_buttons['toggle_monitoring'].config(text=text)
     
-    def update_status(self, camera_available=None, mouse_available=None, monitoring_active=None):
+    def update_status(self, camera_available=None, monitoring_active=None):
         if camera_available is not None and 'camera' in self.status_indicators:
             color = ModernColors.SUCCESS if camera_available else ModernColors.ERROR
             self.status_indicators['camera'].config(fg=color)
-        if mouse_available is not None and 'mouse' in self.status_indicators:
-            color = ModernColors.SUCCESS if mouse_available else ModernColors.ERROR
-            self.status_indicators['mouse'].config(fg=color)
         if monitoring_active is not None and 'monitoring' in self.status_indicators:
             color = ModernColors.SUCCESS if monitoring_active else ModernColors.ERROR
             self.status_indicators['monitoring'].config(fg=color)
@@ -605,10 +597,10 @@ class SimpleMainUI:
         if self.user_list_widget:
             self.user_list_widget.refresh(users)
     
-    def add_mouse_log(self, message: str, level: str = "INFO"):
-        if self.mouse_log_widget:
-            self.mouse_log_widget.add_log(message, level)
-    
+    def add_security_log(self, message: str, level: str = "INFO"):
+        if self.security_log_widget:
+            self.security_log_widget.add_log(message, level)
+
     def add_system_log(self, message: str, level: str = "INFO"):
         if hasattr(self, 'system_log_widget'):
             self.system_log_widget.add_log(message, level)
