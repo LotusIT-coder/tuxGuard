@@ -50,41 +50,49 @@ class SimplePinDialog:
         """Zeigt den PIN-Dialog"""
         self.dialog = tk.Toplevel(self.parent)
         self.dialog.title(self.title)
-        self.dialog.geometry("350x200")
+        self.dialog.geometry("420x280")
         self.dialog.configure(bg=ModernColors.SURFACE)
+        self.dialog.transient(self.parent)
         
         # Zentrieren
         sw, sh = self.dialog.winfo_screenwidth(), self.dialog.winfo_screenheight()
-        x = (sw - 350) // 2
-        y = (sh - 200) // 2
-        self.dialog.geometry(f"350x200+{x}+{y}")
+        x = (sw - 420) // 2
+        y = (sh - 280) // 2
+        self.dialog.geometry(f"420x280+{x}+{y}")
         
         self.dialog.attributes('-topmost', True)
         self.dialog.focus_force()
-        self.dialog.grab_set()
+        # Wenn das Parent-Fenster bereits einen Grab hält (Sperr-Overlay),
+        # darf hier kein zweiter Grab gesetzt werden.
+        if self.parent.grab_current() is None:
+            self.dialog.grab_set()
         self.dialog.protocol("WM_DELETE_WINDOW", self._cancel)
-        self.dialog.minsize(320, 180)
+        self.dialog.minsize(380, 250)
         self.dialog.resizable(True, True)
-        
+
+        content = Frame(self.dialog, bg=ModernColors.SURFACE)
+        content.pack(fill=tk.BOTH, expand=True, padx=14, pady=12)
+
         # Icon und Titel
-        Label(self.dialog, text="🔒", font=("Arial", 32),
-              bg=ModernColors.SURFACE, fg=ModernColors.PRIMARY).pack(pady=(20, 5))
-        
-        Label(self.dialog, text=self.title, font=("Arial", 14, "bold"),
+        Label(content, text="🔒", font=("Arial", 32),
+              bg=ModernColors.SURFACE, fg=ModernColors.PRIMARY).pack(pady=(4, 2))
+
+        Label(content, text=self.title, font=("Arial", 14, "bold"),
               bg=ModernColors.SURFACE, fg=ModernColors.TEXT_PRIMARY).pack()
-        
-        Label(self.dialog, text=self.reason, font=("Arial", 9),
-              bg=ModernColors.SURFACE, fg=ModernColors.TEXT_SECONDARY).pack(pady=10)
+
+        Label(content, text=self.reason, font=("Arial", 9),
+              bg=ModernColors.SURFACE, fg=ModernColors.TEXT_SECONDARY,
+              wraplength=360, justify="center").pack(pady=8)
         
         # PIN-Eingabe
-        self.pin_entry = Entry(self.dialog, show='●', font=("Arial", 12),
+        self.pin_entry = Entry(content, show='●', font=("Arial", 12),
                               bg=ModernColors.BACKGROUND, justify='center', bd=2)
-        self.pin_entry.pack(pady=10, padx=30, fill=tk.X)
+        self.pin_entry.pack(pady=8, padx=18, fill=tk.X)
         self.pin_entry.focus_set()
         
         # Buttons
-        button_frame = Frame(self.dialog, bg=ModernColors.SURFACE)
-        button_frame.pack(pady=15)
+        button_frame = Frame(content, bg=ModernColors.SURFACE)
+        button_frame.pack(side=tk.BOTTOM, pady=(10, 2))
         
         Button(button_frame, text="✓ OK", command=self._ok,
                bg=ModernColors.SUCCESS, fg=ModernColors.TEXT_ON_PRIMARY,
@@ -278,6 +286,8 @@ class SimpleMainUI:
         self.deadman_action_var = None
         self.deadman_timeout_row = None
         self.deadman_action_row = None
+        self.minimize_behavior_var = None
+        self.close_behavior_var = None
         self.monitor_preview_label = None
         self.monitor_preview_image = None
         self.monitor_preview_status_label = None
@@ -396,6 +406,12 @@ class SimpleMainUI:
         if self.deadman_action_var is not None:
             self.deadman_action_var.set(deadman_action)
         self._update_security_settings_visibility()
+
+    def set_ui_behavior(self, minimize_behavior: str, close_behavior: str):
+        if self.minimize_behavior_var is not None:
+            self.minimize_behavior_var.set(minimize_behavior)
+        if self.close_behavior_var is not None:
+            self.close_behavior_var.set(close_behavior)
     
     def _create_control_section(self, parent, title, buttons):
         container = Frame(parent, bg=ModernColors.SURFACE, relief=tk.RIDGE, bd=2)
@@ -473,6 +489,58 @@ class SimpleMainUI:
         )
         action_box.pack(side=tk.LEFT, padx=10)
         action_box.bind("<<ComboboxSelected>>", lambda _e: self._emit_security_settings())
+
+        ttk.Separator(container, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=10, pady=(6, 8))
+
+        Label(
+            container,
+            text="🪟 UI-Verhalten",
+            font=("Arial", 10, "bold"),
+            bg=ModernColors.SURFACE,
+            fg=ModernColors.TEXT_PRIMARY
+        ).pack(anchor="w", padx=10, pady=(0, 4))
+
+        self.minimize_behavior_var = tk.StringVar(value="tray")
+        self.close_behavior_var = tk.StringVar(value="ask")
+
+        minimize_row = Frame(container, bg=ModernColors.SURFACE)
+        minimize_row.pack(fill=tk.X, padx=10, pady=4)
+        Label(minimize_row, text="Beim Minimieren:", bg=ModernColors.SURFACE).pack(side=tk.LEFT)
+        minimize_box = ttk.Combobox(
+            minimize_row,
+            textvariable=self.minimize_behavior_var,
+            state="readonly",
+            values=["tray", "normal"],
+            width=18,
+        )
+        minimize_box.pack(side=tk.LEFT, padx=10)
+        minimize_box.bind("<<ComboboxSelected>>", lambda _e: self._emit_ui_behavior_settings())
+
+        close_row = Frame(container, bg=ModernColors.SURFACE)
+        close_row.pack(fill=tk.X, padx=10, pady=4)
+        Label(close_row, text="Beim Schließen:", bg=ModernColors.SURFACE).pack(side=tk.LEFT)
+        close_box = ttk.Combobox(
+            close_row,
+            textvariable=self.close_behavior_var,
+            state="readonly",
+            values=["ask", "tray", "quit"],
+            width=18,
+        )
+        close_box.pack(side=tk.LEFT, padx=10)
+        close_box.bind("<<ComboboxSelected>>", lambda _e: self._emit_ui_behavior_settings())
+
+        Button(
+            container,
+            text="🔐 Weiteres Admin-Passwort hinzufügen",
+            command=lambda: self._call_callback('add_admin_password'),
+            bg=ModernColors.PRIMARY,
+            fg=ModernColors.TEXT_ON_PRIMARY,
+            font=("Arial", 9, "bold"),
+            padx=12,
+            pady=5,
+            bd=0,
+        ).pack(anchor="w", padx=10, pady=(8, 10))
+
         self._update_security_settings_visibility()
 
     def _create_monitor_preview_section(self, parent):
@@ -540,6 +608,17 @@ class SimpleMainUI:
                 )
             except Exception as e:
                 logger.error(f"Sicherheitsmodus-Callback fehlgeschlagen: {e}")
+
+    def _emit_ui_behavior_settings(self):
+        callback = self.callbacks.get("ui_behavior_changed")
+        if callback:
+            try:
+                callback(
+                    self.minimize_behavior_var.get(),
+                    self.close_behavior_var.get(),
+                )
+            except Exception as e:
+                logger.error(f"UI-Verhalten-Callback fehlgeschlagen: {e}")
     
     def _create_users_tab(self):
         frame = Frame(self.notebook, bg=ModernColors.BACKGROUND)
@@ -640,7 +719,8 @@ class SimpleMainUI:
             )
     
     def configure_camera_buttons(self, enabled: bool):
-        state = tk.NORMAL if enabled else tk.DISABLED
+        # Diagnose/Test sollen auch im Fehlerfall nutzbar bleiben.
+        state = tk.NORMAL
         for key in ['test_camera', 'diagnose_camera']:
             if key in self.control_buttons:
                 self.control_buttons[key].config(state=state)

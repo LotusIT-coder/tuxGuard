@@ -82,6 +82,8 @@ class Config:
     PIN_DIALOG_GEOMETRY = "300x220"
     CAMERA_PERMISSION_DIALOG_GEOMETRY = "400x250"
     APP_ICON_PATH = _SCRIPT_DIR / "tux_256.png"
+    MINIMIZE_BEHAVIOR = "tray"   # "tray" | "normal"
+    CLOSE_BEHAVIOR = "ask"       # "ask" | "tray" | "quit"
     
     # Systemtray
     TRAY_ICON_SIZE = (64, 64)

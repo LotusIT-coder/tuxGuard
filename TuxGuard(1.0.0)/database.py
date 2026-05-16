@@ -309,6 +309,30 @@ class DatabaseManager:
             logger.error(f"Fehler bei PIN-Verifikation: {e}")
             return False
 
+    def verify_user_pin_for_user(self, user_name: str, pin: str) -> bool:
+        """Verifiziert die PIN eines konkreten Benutzers."""
+        if not user_name or not pin:
+            return False
+        try:
+            self.cursor.execute("SELECT pin_hash FROM users WHERE name = ?", (user_name,))
+            row = self.cursor.fetchone()
+            if not row or not row[0]:
+                return False
+
+            stored_hash = row[0]
+            is_valid = SecurityUtils.verify_pin(pin, stored_hash)
+
+            # Upgrade legacy hash falls nötig
+            if is_valid and not stored_hash.startswith("pbkdf2_sha256$"):
+                SecurityUtils.upgrade_pin_hash(self.cursor, pin, stored_hash)
+                self.conn.commit()
+                logger.info("PIN-Hash auf PBKDF2 aktualisiert (Benutzer: %s)", user_name)
+
+            return is_valid
+        except Exception as e:
+            logger.error(f"Fehler bei benutzerbezogener PIN-Verifikation: {e}")
+            return False
+
     # ------------------------------------------------------------------
     # Passwort- / Admin-Verwaltung
     # ------------------------------------------------------------------

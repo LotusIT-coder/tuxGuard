@@ -253,12 +253,16 @@ class CameraManager:
         
         # Prozesse die Kamera verwenden
         try:
-            result = sp.run(['lsof', '/dev/video*'], 
-                          capture_output=True, text=True, timeout=5)
-            if result.stdout.strip():
-                report.append(f"3. Kamera wird verwendet von:\n{result.stdout}")
+            lsof_targets = [f'/dev/video{i}' for i in range(5) if os.path.exists(f'/dev/video{i}')]
+            if lsof_targets:
+                result = sp.run(['lsof', *lsof_targets],
+                              capture_output=True, text=True, timeout=5)
+                if result.stdout.strip():
+                    report.append(f"3. Kamera wird verwendet von:\n{result.stdout}")
+                else:
+                    report.append("3. Kamera wird von keinem Prozess verwendet")
             else:
-                report.append("3. Kamera wird von keinem Prozess verwendet")
+                report.append("3. Keine /dev/video-Geräte für lsof-Prüfung gefunden")
         except (sp.TimeoutExpired, FileNotFoundError):
             report.append("3. lsof nicht verfügbar")
         

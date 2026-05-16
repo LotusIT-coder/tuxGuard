@@ -9,7 +9,7 @@ fi
 # Installiere benötigte Systempakete
 echo "Installiere Abhängigkeiten..."
 apt-get update
-apt-get install -y python3 python3-venv python3-tk git i3lock
+apt-get install -y python3 python3-venv python3-tk git i3lock v4l-utils lsof
 
 # Erstelle Programmverzeichnis
 echo "Erstelle Programmverzeichnis..."

@@ -95,11 +95,14 @@ class TuxGuardApplication:
         self.security_lock_status_label = None
         self.security_lock_unlock_pending = False
         self.strict_unlock_prompt_active = False
+        self.force_admin_unlock_required = False
         self.deadman_triggered = False
         self.last_authorized_seen_at = time.time()
         self.deadman_thread = None
         self.current_user: Optional[str] = None
         self.current_user_is_admin: bool = False
+        self.minimize_behavior = Config.MINIMIZE_BEHAVIOR
+        self.close_behavior = Config.CLOSE_BEHAVIOR
         
         # Threads
         self.active_threads = []
@@ -286,13 +289,7 @@ class TuxGuardApplication:
     # ------------------------------------------------------------------
 
     def _require_admin_password(self, reason: str = "Diese Aktion benötigt Admin-Rechte.") -> bool:
-        """Prompt für ein Admin-Passwort. Aktueller Admin-Status wird
-        automatisch akzeptiert (ohne erneuten Prompt), wenn explizit erwünscht?
-        Hier verlangen wir IMMER eine Eingabe, um sensible Aktionen zu schützen."""
-        if not self.db_manager.has_admin():
-            messagebox.showwarning("Kein Admin",
-                                   "Es ist kein Admin-Benutzer angelegt.")
-            return False
+        """Prompt für ein Admin-Passwort (Master oder zusätzliches Admin-Passwort)."""
         dialog = PasswordDialog(
             self.root,
             title="Admin-Passwort erforderlich",
@@ -302,11 +299,10 @@ class TuxGuardApplication:
         password = dialog.show()
         if password is None:
             return False
-        match = self.db_manager.find_user_by_password(password, admin_only=True)
-        if match is None:
+        if not self.master_auth.verify_admin_password(password):
             messagebox.showerror("Fehler", "Ungültiges Admin-Passwort.")
             return False
-        self.logger.info("Admin-Aktion autorisiert durch '%s': %s", match[1], reason)
+        self.logger.info("Admin-Aktion autorisiert: %s", reason)
         return True
     def _has_registered_users(self):
         try:
@@ -393,7 +389,9 @@ class TuxGuardApplication:
         self.ui.set_callback('diagnose_camera', self._diagnose_camera)
         self.ui.set_callback('toggle_monitoring', self._toggle_monitoring)
         self.ui.set_callback('add_new_user', self._add_new_user)
+        self.ui.set_callback('add_admin_password', self._add_additional_admin_password)
         self.ui.set_callback('security_settings_changed', self._on_security_settings_changed)
+        self.ui.set_callback('ui_behavior_changed', self._on_ui_behavior_changed)
         
         # Kamera Callbacks
         self.camera_manager.set_callbacks(
@@ -413,11 +411,13 @@ class TuxGuardApplication:
         
         # Window Callback
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+        self.root.bind("<Unmap>", self._on_window_unmap)
         self.ui.set_security_settings(
             self.security_mode,
             self.deadman_timeout_seconds,
             self.deadman_action,
         )
+        self.ui.set_ui_behavior(self.minimize_behavior, self.close_behavior)
 
     def _setup_ui_logging(self):
         """Lädt vorhandene Logs in die GUI und spiegelt neue Einträge live hinein."""
@@ -487,6 +487,86 @@ class TuxGuardApplication:
         if self.security_lock_active:
             self._update_security_lock_status()
 
+    def _on_ui_behavior_changed(self, minimize_behavior: str, close_behavior: str):
+        """Übernimmt UI-Verhalten für Minimieren/Schließen (Admin-geschützt)."""
+        if minimize_behavior not in {"tray", "normal"}:
+            minimize_behavior = Config.MINIMIZE_BEHAVIOR
+        if close_behavior not in {"ask", "tray", "quit"}:
+            close_behavior = Config.CLOSE_BEHAVIOR
+
+        if not self._require_admin_password(
+            "Änderungen am UI-Verhalten erfordern das Admin-Passwort."
+        ):
+            if self.ui:
+                self.ui.set_ui_behavior(self.minimize_behavior, self.close_behavior)
+            return
+
+        self.minimize_behavior = minimize_behavior
+        self.close_behavior = close_behavior
+        self.logger.info(
+            "UI-Verhalten aktualisiert: minimieren=%s schliessen=%s",
+            self.minimize_behavior,
+            self.close_behavior,
+        )
+
+    def _add_additional_admin_password(self):
+        """Fügt ein weiteres Admin-Passwort hinzu (nur mit primärem Admin-Passwort)."""
+        primary_dialog = PasswordDialog(
+            self.root,
+            title="Primäres Admin-Passwort",
+            reason="Bitte primäres Admin-Passwort eingeben, um ein weiteres Admin-Passwort anzulegen.",
+            allow_cancel=True,
+        )
+        primary_password = primary_dialog.show()
+        if not primary_password:
+            return
+        if not self.master_auth.verify(primary_password):
+            messagebox.showerror("Fehler", "Primäres Admin-Passwort ist falsch.")
+            return
+
+        new_dialog = PasswordDialog(
+            self.root,
+            title="Neues Admin-Passwort",
+            reason=f"Neues Admin-Passwort (mind. {Config.MIN_PASSWORD_LENGTH} Zeichen):",
+            allow_cancel=True,
+        )
+        new_password = new_dialog.show()
+        if not new_password:
+            return
+
+        confirm_dialog = PasswordDialog(
+            self.root,
+            title="Admin-Passwort bestätigen",
+            reason="Bitte neues Admin-Passwort zur Bestätigung erneut eingeben.",
+            allow_cancel=True,
+        )
+        confirm_password = confirm_dialog.show()
+        if not confirm_password:
+            return
+        if new_password != confirm_password:
+            messagebox.showerror("Fehler", "Passwörter stimmen nicht überein.")
+            return
+
+        try:
+            total = self.master_auth.add_admin_password(primary_password, new_password)
+            messagebox.showinfo(
+                "Erfolg",
+                f"Zusätzliches Admin-Passwort gespeichert. Insgesamt hinterlegte Admin-Passwörter: {total}",
+            )
+            self.logger.info("Zusätzliches Admin-Passwort angelegt")
+        except MasterAuthError as exc:
+            messagebox.showerror("Fehler", str(exc))
+
+    def _on_window_unmap(self, _event=None):
+        """Reagiert auf Minimieren des Hauptfensters."""
+        try:
+            if self.tray_icon is not None:
+                return
+            if self.root.state() == "iconic" and self.minimize_behavior == "tray":
+                self.root.after(100, self._minimize_to_tray)
+        except Exception:
+            pass
+
     def _deadman_monitor_loop(self):
         """Überwacht Sperr- und Totmannschalter-Timeouts während der Überwachung."""
         while self.monitoring_active:
@@ -520,7 +600,7 @@ class TuxGuardApplication:
         except Exception as exc:
             self.logger.error("Totmannschalter-Aktion fehlgeschlagen: %s", exc)
 
-    def _activate_security_lock(self, reason: str):
+    def _activate_security_lock(self, reason: str, force_admin_password: bool = False):
         """Zeigt den TuxGuard-Sperrbildschirm an, ohne die Kameraüberwachung zu stoppen.
 
         - Nach 10s ohne legitimen Nutzer wird die Sperre aktiviert.
@@ -531,6 +611,8 @@ class TuxGuardApplication:
         """
         if self.security_lock_active:
             self.security_lock_reason = reason
+            if force_admin_password:
+                self.force_admin_unlock_required = True
             self._update_security_lock_status()
             return
 
@@ -538,6 +620,7 @@ class TuxGuardApplication:
         self.security_lock_reason = reason
         self.strict_unlock_prompt_active = False
         self.security_lock_unlock_pending = False
+        self.force_admin_unlock_required = force_admin_password
         self.logger.warning("Sperrbildschirm aktiviert: %s", reason)
 
         # Optional: Computer-Session sperren
@@ -588,12 +671,14 @@ class TuxGuardApplication:
         )
         self.security_lock_status_label.pack()
 
-        # Bind: in strict_pin löst jede Taste/Maustaste den Passwort-/PIN-Prompt aus.
-        # In self_unlock erfolgt die Entsperrung automatisch durch Gesichtserkennung,
-        # daher hier keine Bindings (sonst poppt der Dialog auch ohne Tastendruck auf,
-        # z.B. weil <Motion> bereits bei minimaler Mausbewegung feuert).
-        # In deadman gibt es generell keine manuelle Entsperrung.
-        if self.security_mode == "strict_pin":
+        # Bei erzwungenem Admin-Entsperren (z.B. kein Benutzer vorhanden)
+        # ist nur der Admin-Passwort-Dialog erlaubt.
+        if self.force_admin_unlock_required:
+            for sequence in ("<Key>", "<Button-1>", "<Button-2>", "<Button-3>"):
+                window.bind(sequence, lambda _e: self._prompt_lock_unlock())
+        # Bind: in strict_pin löst jede Taste/Maustaste den PIN-Prompt aus.
+        # In self_unlock erfolgt die Entsperrung automatisch durch Gesichtserkennung.
+        elif self.security_mode == "strict_pin":
             def _trigger_unlock(_event=None):
                 self._prompt_strict_unlock(self.current_user)
 
@@ -619,7 +704,7 @@ class TuxGuardApplication:
             self.logger.error("System-Lock fehlgeschlagen: %s", exc)
 
     def _prompt_lock_unlock(self):
-        """Zeigt den Passwort-Dialog zur Aufhebung der TuxGuard-Sperre."""
+        """Zeigt den Admin-Passwort-Dialog zur Aufhebung der TuxGuard-Sperre."""
         if not self.security_lock_active or self.security_lock_unlock_pending:
             return
         self.security_lock_unlock_pending = True
@@ -627,21 +712,19 @@ class TuxGuardApplication:
             dialog = PasswordDialog(
                 self.security_lock_window or self.root,
                 title="TuxGuard – Bildschirm entsperren",
-                reason="Bitte geben Sie Ihr Passwort ein, um die Sperre aufzuheben.",
+                reason="Bitte geben Sie ein gültiges Admin-Passwort ein.",
                 allow_cancel=False,
             )
             password = dialog.show()
             if not password:
                 return
-            match = self.db_manager.find_user_by_password(password)
-            if match is None:
+            if not self.master_auth.verify_admin_password(password):
                 messagebox.showerror("Falsches Passwort",
                                      "Das eingegebene Passwort ist ungültig.")
                 return
-            user_id, username, _ = match
             self.last_authorized_seen_at = time.time()
             self.deadman_triggered = False
-            self._release_security_lock(username)
+            self._release_security_lock("Admin")
         finally:
             self.security_lock_unlock_pending = False
 
@@ -656,6 +739,11 @@ class TuxGuardApplication:
             text = (
                 "Totmannschalter aktiv.\n"
                 f"Wenn kein legitimer Nutzer erkannt wird: {action} in {remaining}s."
+            )
+        elif self.force_admin_unlock_required:
+            text = (
+                "Keine gültigen Benutzerdaten verfügbar.\n"
+                "Entsperren ist nur mit einem Admin-Passwort möglich."
             )
         elif self.security_mode == "self_unlock":
             text = ("Warte auf einen legitimen Nutzer.\n"
@@ -682,6 +770,22 @@ class TuxGuardApplication:
         self.security_lock_reason = ""
         self.strict_unlock_prompt_active = False
         self.security_lock_unlock_pending = False
+        self.force_admin_unlock_required = False
+
+        # Falls die Kamera während der Sperrphase freigegeben/gestoppt wurde,
+        # wird die aktive Überwachung nach Entsperren sofort wieder angehoben.
+        if self.monitoring_active and self.camera_manager and self.camera_manager.is_available:
+            if not self.camera_manager.is_active:
+                try:
+                    if self.camera_manager.start():
+                        self.ui.add_security_log("Kameraüberwachung nach Entsperren fortgesetzt", "SUCCESS")
+                        self.logger.info("Kameraüberwachung nach Entsperren fortgesetzt")
+                    else:
+                        self.ui.add_security_log("Kamera konnte nach Entsperren nicht gestartet werden", "WARNING")
+                        self.logger.warning("Kamera konnte nach Entsperren nicht gestartet werden")
+                except Exception as exc:
+                    self.logger.error("Neustart der Kamera nach Entsperren fehlgeschlagen: %s", exc)
+
         if user_name:
             self.ui.add_security_log(f"Sperrbildschirm aufgehoben: {user_name}", "SUCCESS")
             self.logger.info("Sperrbildschirm aufgehoben durch legitimen Nutzer: %s", user_name)
@@ -710,7 +814,14 @@ class TuxGuardApplication:
             pin = pin_dialog.show()
             if pin is None:
                 return
-            if self.db_manager.verify_user_pin(pin):
+            # Bei erkanntem Nutzer muss dessen PIN passen; ohne erkannten Nutzer
+            # bleibt der bisherige Fallback erhalten.
+            if user_name:
+                pin_valid = self.db_manager.verify_user_pin_for_user(user_name, pin)
+            else:
+                pin_valid = self.db_manager.verify_user_pin(pin)
+
+            if pin_valid:
                 self.last_authorized_seen_at = time.time()
                 self.deadman_triggered = False
                 self._release_security_lock(user_name)
@@ -1030,10 +1141,32 @@ class TuxGuardApplication:
     def _delete_user(self, user_name: str):
         """Löscht einen Benutzer"""
         try:
+            if not self._require_admin_password(
+                f"Das Löschen von Benutzer '{user_name}' erfordert ein Admin-Passwort."
+            ):
+                return
+
+            if not messagebox.askyesno(
+                "Benutzer löschen",
+                f"Benutzer '{user_name}' wirklich löschen?\nDiese Aktion kann nicht rückgängig gemacht werden.",
+            ):
+                return
+
             if self.db_manager.delete_user(user_name):
                 messagebox.showinfo("Erfolg", f"Benutzer '{user_name}' wurde gelöscht.")
                 self._refresh_user_list()
                 self.logger.info(f"Benutzer '{user_name}' gelöscht")
+
+                if self.monitoring_active and not self._has_registered_users():
+                    self._stop_monitoring()
+                    self.ui.add_security_log(
+                        "Alle Benutzer gelöscht - Überwachung gestoppt, Admin-Entsperrung erforderlich",
+                        "ERROR",
+                    )
+                    self._activate_security_lock(
+                        "Keine Benutzer mehr vorhanden. Entsperren nur mit Admin-Passwort.",
+                        force_admin_password=True,
+                    )
             else:
                 messagebox.showwarning("Warnung", f"Benutzer '{user_name}' nicht gefunden.")
         except Exception as e:
@@ -1060,6 +1193,7 @@ class TuxGuardApplication:
         if (
             self.security_lock_active
             and self.security_mode == "self_unlock"
+            and not self.force_admin_unlock_required
             and not self.security_lock_unlock_pending
         ):
             # Auf den Tk-Hauptthread zurückschalten (UI-Operationen).
@@ -1149,6 +1283,16 @@ class TuxGuardApplication:
     def _start_monitoring(self):
         """Startet die Überwachung"""
         try:
+            if not self._has_registered_users():
+                self.monitoring_active = False
+                self.ui.update_monitoring_button(False)
+                self.ui.add_security_log("Überwachung nicht möglich: keine Benutzer vorhanden", "ERROR")
+                messagebox.showwarning(
+                    "Überwachung nicht möglich",
+                    "Es sind keine Benutzer hinterlegt. Bitte zuerst mindestens einen Benutzer anlegen.",
+                )
+                return
+
             self.monitoring_active = True
             self.last_authorized_seen_at = time.time()
             self.deadman_triggered = False
@@ -1203,13 +1347,20 @@ class TuxGuardApplication:
     def _minimize_to_tray(self):
         """Minimiert die Anwendung in die Systemleiste"""
         try:
+            if self.tray_icon is not None:
+                return
+
             # Verstecke Hauptfenster
             self.root.withdraw()
             
             # Erstelle Tray-Icon
-            image = Image.new('RGB', Config.TRAY_ICON_SIZE, color='white')
-            draw = ImageDraw.Draw(image)
-            draw.rectangle((0, 0) + Config.TRAY_ICON_SIZE, fill=Config.TRAY_ICON_COLOR)
+            if Config.APP_ICON_PATH.exists():
+                image = Image.open(Config.APP_ICON_PATH).convert("RGBA")
+                image.thumbnail(Config.TRAY_ICON_SIZE, Image.Resampling.LANCZOS)
+            else:
+                image = Image.new('RGB', Config.TRAY_ICON_SIZE, color='white')
+                draw = ImageDraw.Draw(image)
+                draw.rectangle((0, 0) + Config.TRAY_ICON_SIZE, fill=Config.TRAY_ICON_COLOR)
             
             menu = pystray.Menu(
                 pystray.MenuItem("Öffnen", self._restore_from_tray),
@@ -1275,12 +1426,24 @@ class TuxGuardApplication:
     # Anwendungsende
     def _on_closing(self):
         """Wird beim Schließen des Hauptfensters aufgerufen"""
-        if self.monitoring_active:
-            # Bei aktiver Überwachung in Tray minimieren
+        if self.close_behavior == "tray":
             self._minimize_to_tray()
-        else:
-            # Sonst direkt beenden
+            return
+        if self.close_behavior == "quit":
             self._quit_application()
+            return
+
+        # close_behavior == "ask"
+        decision = messagebox.askyesnocancel(
+            "TuxGuard schließen",
+            "Ja: Anwendung beenden\nNein: In die Systemleiste minimieren\nAbbrechen: Aktion abbrechen",
+        )
+        if decision is None:
+            return
+        if decision:
+            self._quit_application()
+        else:
+            self._minimize_to_tray()
     
     def _quit_application(self):
         """Beendet die Anwendung"""

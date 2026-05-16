@@ -14,6 +14,9 @@ Speicherformat (JSON in ``Config.MASTER_CREDENTIALS_FILE``)::
     {
         "version": 1,
         "password": "pbkdf2_sha256$<iter>$<salt>$<hash>",
+        "additional_passwords": [
+            "pbkdf2_sha256$<iter>$<salt>$<hash>"
+        ],
         "recovery": "pbkdf2_sha256$<iter>$<salt>$<hash>",
         "created_at": "2024-01-01T12:00:00"
     }
@@ -126,6 +129,7 @@ class MasterAuth:
         self._save({
             "version": self.VERSION,
             "password": hash_password(password),
+            "additional_passwords": [],
             "recovery": hash_password(normalized),
             "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         })
@@ -154,6 +158,48 @@ class MasterAuth:
             return False
         return verify_password(normalize_recovery_code(code), data.get("recovery", ""))
 
+    def verify_admin_password(self, password: str) -> bool:
+        """Prüft ein Admin-Passwort (primär oder zusätzlich)."""
+        if not password:
+            return False
+        try:
+            data = self._load()
+        except FileNotFoundError:
+            return False
+
+        if verify_password(password, data.get("password", "")):
+            return True
+
+        for stored_hash in data.get("additional_passwords", []):
+            if verify_password(password, stored_hash):
+                return True
+        return False
+
+    def add_admin_password(self, primary_admin_password: str, new_password: str) -> int:
+        """Fügt ein weiteres Admin-Passwort hinzu.
+
+        Autorisierung erfolgt bewusst nur über das primäre Master-Passwort.
+        Gibt die Gesamtanzahl hinterlegter Admin-Passwörter zurück.
+        """
+        if not self.verify(primary_admin_password):
+            raise MasterAuthError("Primäres Admin-Passwort ungültig.")
+        self._validate_password(new_password)
+
+        data = self._load()
+        additional = list(data.get("additional_passwords", []))
+
+        if verify_password(new_password, data.get("password", "")):
+            raise MasterAuthError("Dieses Passwort ist bereits als primäres Admin-Passwort gesetzt.")
+        for stored_hash in additional:
+            if verify_password(new_password, stored_hash):
+                raise MasterAuthError("Dieses Passwort ist bereits als zusätzliches Admin-Passwort vorhanden.")
+
+        additional.append(hash_password(new_password))
+        data["additional_passwords"] = additional
+        self._save(data)
+        logger.info("Zusätzliches Admin-Passwort hinzugefügt")
+        return 1 + len(additional)
+
     # -- Passwortänderung -------------------------------------------------
 
     def change_password_with_recovery(self, recovery_code: str, new_password: str) -> str:
@@ -166,10 +212,14 @@ class MasterAuth:
             raise MasterAuthError("Ungültiger Recovery-Code.")
         self._validate_password(new_password)
 
+        data = self._load()
+        additional = list(data.get("additional_passwords", []))
+
         new_code = generate_recovery_code()
         self._save({
             "version": self.VERSION,
             "password": hash_password(new_password),
+            "additional_passwords": additional,
             "recovery": hash_password(normalize_recovery_code(new_code)),
             "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         })
