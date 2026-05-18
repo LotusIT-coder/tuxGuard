@@ -35,6 +35,49 @@ class ModernColors:
     ERROR = "#E74C3C"
     INFO = "#3498DB"
 
+class ScrollFrame(Frame):
+    """Ein Frame mit automatischem Scrollbar wenn Content zu groß ist"""
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, **kwargs)
+        
+        # Canvas mit Scrollbar
+        self.canvas = Canvas(self, highlightthickness=0, bg=kwargs.get('bg', ModernColors.BACKGROUND))
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        
+        # Content Frame
+        self.content_frame = Frame(self.canvas, bg=kwargs.get('bg', ModernColors.BACKGROUND))
+        
+        # Window im Canvas
+        self.window = self.canvas.create_window((0, 0), window=self.content_frame, anchor="nw")
+        
+        # Scrollbar verbinden
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Mousewheel Scrolling
+        self.content_frame.bind("<MouseWheel>", self._on_mousewheel)
+        self.content_frame.bind("<Button-4>", self._on_mousewheel)
+        self.content_frame.bind("<Button-5>", self._on_mousewheel)
+        
+        # Update scroll region wenn Content ändert
+        self.content_frame.bind("<Configure>", self._on_frame_configure)
+        
+        # Packing
+        self.canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+    
+    def _on_frame_configure(self, event=None):
+        """Update scroll region wenn Frame ändert"""
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        # Canvas width = content width
+        self.canvas.itemconfigure(self.window, width=self.canvas.winfo_width())
+    
+    def _on_mousewheel(self, event):
+        """Mousewheel Scrolling"""
+        if event.num == 5 or event.delta < 0:
+            self.canvas.yview_scroll(3, "units")
+        elif event.num == 4 or event.delta > 0:
+            self.canvas.yview_scroll(-3, "units")
+
 class SimplePinDialog:
     """Vereinfachter PIN-Dialog"""
     
@@ -297,7 +340,23 @@ class SimpleMainUI:
     
     def _setup_window(self):
         self.parent.title(f"🛡️ {Config.APP_NAME} v{Config.APP_VERSION}")
-        self.parent.geometry("900x700")
+        
+        # Fenster aktualisieren um Bildschirmgröße zu ermitteln
+        self.parent.update_idletasks()
+        
+        # Bildschirmdimensionen abrufen
+        screen_width = self.parent.winfo_screenwidth()
+        screen_height = self.parent.winfo_screenheight()
+        
+        # Optimale Fenstergröße: 85% der Bildschirmgröße, min 800x600, max 1400x900
+        window_width = max(800, min(1400, int(screen_width * 0.85)))
+        window_height = max(600, min(900, int(screen_height * 0.85)))
+        
+        # Fenster zentrieren
+        x = (screen_width - window_width) // 2
+        y = (screen_height - window_height) // 2
+        
+        self.parent.geometry(f"{window_width}x{window_height}+{x}+{y}")
         self.parent.configure(bg=ModernColors.BACKGROUND)
         self.parent.minsize(800, 600)
     
@@ -354,8 +413,9 @@ class SimpleMainUI:
             self.status_indicators[key] = indicator
     
     def _create_monitoring_tab(self):
-        frame = Frame(self.notebook, bg=ModernColors.BACKGROUND)
-        self.notebook.add(frame, text="🖥️ Überwachung")
+        scroll_frame = ScrollFrame(self.notebook, bg=ModernColors.BACKGROUND)
+        self.notebook.add(scroll_frame, text="🖥️ Überwachung")
+        frame = scroll_frame.content_frame
 
         # Autostart-Checkbox oben platzieren
         autostart_frame = Frame(frame, bg=ModernColors.SURFACE, relief=tk.RIDGE, bd=2)
@@ -621,8 +681,9 @@ class SimpleMainUI:
                 logger.error(f"UI-Verhalten-Callback fehlgeschlagen: {e}")
     
     def _create_users_tab(self):
-        frame = Frame(self.notebook, bg=ModernColors.BACKGROUND)
-        self.notebook.add(frame, text="👥 Benutzer")
+        scroll_frame = ScrollFrame(self.notebook, bg=ModernColors.BACKGROUND)
+        self.notebook.add(scroll_frame, text="👥 Benutzer")
+        frame = scroll_frame.content_frame
         
         # Neuer Benutzer
         add_frame = Frame(frame, bg=ModernColors.SURFACE, relief=tk.RIDGE, bd=2)
@@ -637,8 +698,9 @@ class SimpleMainUI:
         self.user_list_widget = SimpleUserListWidget(frame)
     
     def _create_logs_tab(self):
-        frame = Frame(self.notebook, bg=ModernColors.BACKGROUND)
-        self.notebook.add(frame, text="📋 Logs")
+        scroll_frame = ScrollFrame(self.notebook, bg=ModernColors.BACKGROUND)
+        self.notebook.add(scroll_frame, text="📋 Logs")
+        frame = scroll_frame.content_frame
         
         self.system_log_widget = SimpleLogWidget(frame, "📋 System-Protokolle")
     
