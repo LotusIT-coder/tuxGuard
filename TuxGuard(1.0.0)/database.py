@@ -463,6 +463,24 @@ class DatabaseManager:
             logger.error(f"Fehler beim Löschen des Benutzers: {e}")
             raise DatabaseError(f"Benutzer konnte nicht gelöscht werden: {e}")
     
+    def delete_face_encoding(self, face_encoding_id: int) -> bool:
+        """Löscht ein einzelnes Gesichtsbild/Encoding anhand seiner ID"""
+        try:
+            self.cursor.execute("DELETE FROM face_encodings WHERE id = ?", (face_encoding_id,))
+            deleted_count = self.cursor.rowcount
+            self.conn.commit()
+            
+            if deleted_count > 0:
+                logger.info(f"Gesichtsbild {face_encoding_id} gelöscht")
+                return True
+            else:
+                logger.warning(f"Gesichtsbild {face_encoding_id} nicht gefunden")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Fehler beim Löschen des Gesichtsbildes: {e}")
+            raise DatabaseError(f"Gesichtsbild konnte nicht gelöscht werden: {e}")
+    
     def __enter__(self):
         """Context Manager Eintritt"""
         self.connect()

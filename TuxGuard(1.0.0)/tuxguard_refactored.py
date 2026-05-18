@@ -1110,7 +1110,7 @@ class TuxGuardApplication:
 
             window.image_refs = []
 
-            for index, (_, desc, image_data, source_filename, created_at) in enumerate(images, 1):
+            for index, (face_id, desc, image_data, source_filename, created_at) in enumerate(images, 1):
                 card = ttk.Frame(content, padding=10, relief="ridge")
                 card.pack(fill=tk.X, expand=True, pady=6)
 
@@ -1132,11 +1132,43 @@ class TuxGuardApplication:
                 ttk.Label(info_frame, text=f"Datei: {source_filename or '-'}").pack(anchor="w", pady=(4, 0))
                 ttk.Label(info_frame, text=f"Gespeichert: {created_at or '-'}").pack(anchor="w", pady=(4, 0))
 
+                button_frame = ttk.Frame(card)
+                button_frame.pack(side=tk.RIGHT, padx=(12, 0))
+                
+                delete_btn = ttk.Button(
+                    button_frame,
+                    text="Löschen",
+                    command=lambda fid=face_id: self._delete_user_image(user_name, fid, window)
+                )
+                delete_btn.pack(padx=4)
+
             self.logger.info("Bildübersicht für Benutzer '%s' geöffnet", user_name)
             
         except Exception as e:
             self.logger.error(f"Fehler beim Anzeigen der Bilder: {e}")
             messagebox.showerror("Fehler", f"Fehler beim Laden der Bilder: {e}")
+    
+    def _delete_user_image(self, user_name: str, face_id: int, window: tk.Toplevel):
+        """Löscht ein einzelnes Nutzerbild"""
+        try:
+            if not messagebox.askyesno(
+                "Bild löschen",
+                f"Dieses Bild wirklich löschen?\nDiese Aktion kann nicht rückgängig gemacht werden."
+            ):
+                return
+            
+            if self.db_manager.delete_face_encoding(face_id):
+                messagebox.showinfo("Erfolg", "Bild wurde gelöscht.")
+                self.logger.info(f"Bild {face_id} für Benutzer '{user_name}' gelöscht")
+                
+                # Fenster schließen und neu laden
+                window.destroy()
+                self._show_user_images(user_name)
+            else:
+                messagebox.showwarning("Warnung", "Bild konnte nicht gelöscht werden.")
+        except Exception as e:
+            self.logger.error(f"Fehler beim Löschen des Bildes: {e}")
+            messagebox.showerror("Fehler", f"Fehler beim Löschen des Bildes: {e}")
     
     def _delete_user(self, user_name: str):
         """Löscht einen Benutzer"""
