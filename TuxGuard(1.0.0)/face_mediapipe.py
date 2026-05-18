@@ -306,7 +306,7 @@ def _detect_with_mediapipe(
                             continue
                         score = float(getattr(category, "score", 0.0) or 0.0)
                         blendshape_scores[name] = max(0.0, min(1.0, score))
-                detections.append((bbox, landmarks, blendshape_scores or None))
+                detections.append((bbox, landmarks, blendshape_scores))
         except Exception as exc:  # pylint: disable=broad-except
             logger.debug("Landmark-Auswertung fehlgeschlagen: %s", exc)
     return detections
