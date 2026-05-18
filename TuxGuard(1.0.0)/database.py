@@ -58,11 +58,16 @@ class SecurityUtils:
 
 class DatabaseManager:
     """Zentrale Datenbankoperationen"""
-    
+
+
+    def _ensure_connected(self):
+        """Stellt sicher, dass eine DB-Verbindung besteht."""
+        if self.conn is None or self.cursor is None:
+            self.connect()
+
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or Config.get_database_path()
-        self.conn = None
-        self.cursor = None
+        self.connect()
         
     def connect(self):
         """Stellt Verbindung zur Datenbank her"""
@@ -148,6 +153,7 @@ class DatabaseManager:
         ``password`` ist optional; wird es übergeben, wird zusätzlich zur PIN ein
         Passwort-Hash gespeichert. ``is_admin`` markiert den Benutzer als Admin.
         """
+        self._ensure_connected()
         if len(pin) < Config.MIN_PIN_LENGTH:
             raise ValueError(f"PIN muss mindestens {Config.MIN_PIN_LENGTH} Zeichen lang sein")
         if password is not None and len(password) < Config.MIN_PASSWORD_LENGTH:
@@ -168,7 +174,9 @@ class DatabaseManager:
             logger.info(
                 "Benutzer '%s' hinzugefügt (ID: %s, admin=%s)", name, user_id, is_admin
             )
-            return user_id
+            if user_id is None:
+                raise DatabaseError("Benutzer wurde hinzugefügt, aber lastrowid ist None")
+            return int(user_id)
         except sqlite3.IntegrityError:
             raise ValueError(f"Benutzername '{name}' existiert bereits")
         except Exception as e:
@@ -184,6 +192,7 @@ class DatabaseManager:
         source_filename: Optional[str] = None,
     ) -> int:
         """Fügt eine Gesichtskodierung für einen Benutzer hinzu"""
+        self._ensure_connected()
         try:
             encoding_blob = sqlite3.Binary(face_encoding.tobytes())
             self.cursor.execute(
@@ -203,13 +212,16 @@ class DatabaseManager:
             encoding_id = self.cursor.lastrowid
             self.conn.commit()
             logger.debug(f"Gesichtskodierung hinzugefügt (ID: {encoding_id}) für Benutzer {user_id}")
-            return encoding_id
+            if encoding_id is None:
+                raise DatabaseError("Gesichtskodierung wurde hinzugefügt, aber lastrowid ist None")
+            return int(encoding_id)
         except Exception as e:
             logger.error(f"Fehler beim Hinzufügen der Gesichtskodierung: {e}")
             raise DatabaseError(f"Gesichtskodierung konnte nicht hinzugefügt werden: {e}")
     
     def get_all_users(self) -> List[Tuple[int, str]]:
         """Gibt alle Benutzer zurück"""
+        self._ensure_connected()
         try:
             self.cursor.execute("SELECT id, name FROM users ORDER BY name")
             return self.cursor.fetchall()
@@ -219,6 +231,7 @@ class DatabaseManager:
 
     def get_user_id(self, user_name: str) -> Optional[int]:
         """Gibt die Benutzer-ID zu einem Namen zurück."""
+        self._ensure_connected()
         try:
             self.cursor.execute("SELECT id FROM users WHERE name = ?", (user_name,))
             row = self.cursor.fetchone()
@@ -229,6 +242,7 @@ class DatabaseManager:
     
     def get_user_face_encodings(self, user_name: str) -> List[Tuple[str, np.ndarray]]:
         """Gibt alle Gesichtskodierungen für einen Benutzer zurück"""
+        self._ensure_connected()
         try:
             self.cursor.execute("""
                 SELECT fe.description, fe.face_encoding 
@@ -249,6 +263,7 @@ class DatabaseManager:
 
     def get_user_face_records(self, user_name: str) -> List[Tuple[int, str, Optional[bytes], Optional[str], str]]:
         """Gibt die gespeicherten Bilder und Metadaten für einen Benutzer zurück."""
+        self._ensure_connected()
         try:
             self.cursor.execute("PRAGMA table_info(face_encodings)")
             columns = {row[1] for row in self.cursor.fetchall()}
@@ -270,6 +285,7 @@ class DatabaseManager:
     
     def get_all_face_encodings(self) -> List[Tuple[str, np.ndarray, str]]:
         """Gibt alle Gesichtskodierungen mit Benutzernamen zurück"""
+        self._ensure_connected()
         try:
             self.cursor.execute("""
                 SELECT u.name, fe.face_encoding, fe.description 
@@ -289,6 +305,7 @@ class DatabaseManager:
     
     def verify_user_pin(self, pin: str) -> bool:
         """Verifiziert eine PIN gegen alle Benutzer"""
+        self._ensure_connected()
         try:
             self.cursor.execute("SELECT pin_hash FROM users LIMIT 1")
             row = self.cursor.fetchone()
@@ -311,6 +328,7 @@ class DatabaseManager:
 
     def verify_user_pin_for_user(self, user_name: str, pin: str) -> bool:
         """Verifiziert die PIN eines konkreten Benutzers."""
+        self._ensure_connected()
         if not user_name or not pin:
             return False
         try:
@@ -339,6 +357,7 @@ class DatabaseManager:
 
     def has_users(self) -> bool:
         """True, wenn mindestens ein Benutzer existiert."""
+        self._ensure_connected()
         try:
             self.cursor.execute("SELECT 1 FROM users LIMIT 1")
             return self.cursor.fetchone() is not None
@@ -348,6 +367,7 @@ class DatabaseManager:
 
     def has_admin(self) -> bool:
         """True, wenn mindestens ein Admin existiert."""
+        self._ensure_connected()
         try:
             self.cursor.execute("SELECT 1 FROM users WHERE is_admin = 1 LIMIT 1")
             return self.cursor.fetchone() is not None
@@ -357,6 +377,7 @@ class DatabaseManager:
 
     def get_users_with_meta(self) -> List[Tuple[int, str, bool, bool]]:
         """Liste aller Benutzer mit (id, name, is_admin, has_password)."""
+        self._ensure_connected()
         try:
             self.cursor.execute(
                 "SELECT id, name, is_admin, password_hash FROM users ORDER BY name"
@@ -371,6 +392,7 @@ class DatabaseManager:
 
     def set_user_password(self, user_name: str, password: str) -> bool:
         """Setzt/aktualisiert das Passwort eines Benutzers."""
+        self._ensure_connected()
         if len(password) < Config.MIN_PASSWORD_LENGTH:
             raise ValueError(
                 f"Passwort muss mindestens {Config.MIN_PASSWORD_LENGTH} Zeichen lang sein"
@@ -389,6 +411,7 @@ class DatabaseManager:
 
     def set_user_admin(self, user_name: str, is_admin: bool) -> bool:
         """Setzt/entfernt das Admin-Flag."""
+        self._ensure_connected()
         try:
             self.cursor.execute(
                 "UPDATE users SET is_admin = ? WHERE name = ?",
@@ -402,6 +425,7 @@ class DatabaseManager:
 
     def verify_user_password(self, user_name: str, password: str) -> bool:
         """Prüft das Passwort eines konkreten Benutzers."""
+        self._ensure_connected()
         if not password:
             return False
         try:
@@ -422,6 +446,7 @@ class DatabaseManager:
         Liefert (id, name, is_admin) oder ``None``. Bei ``admin_only=True``
         werden nur Admin-Benutzer berücksichtigt.
         """
+        self._ensure_connected()
         if not password:
             return None
         try:
@@ -439,6 +464,7 @@ class DatabaseManager:
     
     def delete_user(self, user_name: str) -> bool:
         """Löscht einen Benutzer und alle zugehörigen Daten"""
+        self._ensure_connected()
         try:
             # Lösche zuerst alle Gesichtskodierungen
             self.cursor.execute("""
@@ -465,6 +491,7 @@ class DatabaseManager:
     
     def delete_face_encoding(self, face_encoding_id: int) -> bool:
         """Löscht ein einzelnes Gesichtsbild/Encoding anhand seiner ID"""
+        self._ensure_connected()
         try:
             self.cursor.execute("DELETE FROM face_encodings WHERE id = ?", (face_encoding_id,))
             deleted_count = self.cursor.rowcount
