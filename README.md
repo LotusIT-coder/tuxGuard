@@ -106,6 +106,56 @@ sudo bash uninstall.sh
 - Kamera prueft auf legitime/illegitime Praesenz.
 - Je nach Modus wird automatisch entsperrt, PIN verlangt oder Deadman-Aktion ausgefuehrt.
 
+## Sicherheitsmodi im Detail
+
+TuxGuard bietet drei distinct Sicherheitsmodi, die in den UI-Einstellungen konfigurierbar sind.
+
+### 1. `self_unlock` - Automatische Entsperrung bei Erkennung
+
+- Erkannter Benutzer hebt Sperre sofort auf, ohne zusaetzliche Eingabe.
+- **Verhaeltnis**: Geringste Intervention, aber auch geringste Huerden.
+- **Anwendungsfall**: Zuhause/vertrauenswuerdigem Umfeld mit zuverlässiger Kamera.
+
+### 2. `strict_pin` - Gesicht + PIN
+
+- Erkannter Benutzer muss zusaetzlich seine PIN eingeben, um zu entsperren.
+- Nutzt den Erkennungsstand als einen Faktor, der PIN ist der zweite.
+- **Verhaeltnis**: Mittleres Sicherheitsniveau mit aktiver Benutzerinteraktion.
+- **Anwendungsfall**: Bueros, gemeinsame Systeme, wo Kamera-Spoofing oder Nachahmer moeglichst abgewehrt werden sollen.
+
+### 3. `deadman` - Totmannschalter mit erzwungener Aktion
+
+**Konzept:**
+- Ein Totmannschalter (Deadman's Switch) ist eine Failsafe-Komponente, die automatisch eine Schutzaktion ausloest, wenn kein explizites Signal mehr eingeht.
+- In TuxGuard: Wenn ueber einen konfigurierbaren Zeitraum (Default: 60 Sekunden) KEINE legitimen Benutzer erkannt werden, wird eine Aktion erzwungen.
+
+**Verhalten:**
+1. Ueberwachung startet.
+2. Wenn legitimer Benutzer erkannt wird, wird der Timer zurueckgesetzt.
+3. Wenn KEIN Benutzer erkannt wird:
+   - Timer laeuft ab.
+   - Aktion wird ausgeloest.
+4. Aktion kann sein:
+   - **`suspend`**: System wird in den Ruhezustand versetzt (ACPI S3/S4).
+   - **`shutdown`**: System wird heruntergefahren.
+
+**Konfiguration:**
+- Timeout: `DEADMAN_TIMEOUT_SECONDS` (in `TuxGuard(1.0.0)/config.py`, Default 60 Sekunden)
+- Aktion: `DEADMAN_ACTION` (in `TuxGuard(1.0.0)/config.py`, Default "suspend")
+- Einstellbar in der UI unter "Sicherheitsmodus" (erfordert Master-Passwort)
+
+**Anwendungsfaelle:**
+- **Raum-Verlassen**: Wenn der legitime Benutzer den Schreibtisch verlaesst und nicht wiederkehrt, wird das System automatisch gesichert.
+- **Kamera-Ausfall-Fallback**: Wenn Kamera abgedeckt/unterbrochen ist und keine Gesichter erkannt werden, triggert Deadman nach kurzer Zeit.
+- **Unerwuenschtes Mitschreiben**: In Bueros, wo das System nach X Sekunden ohne Autorisierung den Zugriff unterbricht.
+- **Physische Sicherheit**: Wenn der Monitor verlassen wird, ohne dass der Benutzer aktiv abgemeldet hat.
+
+**Wichtige Hinweise:**
+- Deadman ist **nicht** dasselbe wie Auto-Lock. Auto-Lock sperrt nach Inaktivitaet des Nutzers; Deadman sperrt/speichert, wenn das System PHYSISCH unbeobachtet ist.
+- Wenn keine Kamera vorhanden ist oder Kamera-Fehler auftritt, laeuft Deadman sofort nach Timeout ab.
+- Eine zu kurze Timeout kann zu unerwünschtem Suspend/Shutdown führen (z. B. bei Kameraschwankungen oder Durchzug).
+- Mindestempfohlener Timeout: 10-30 Sekunden (Balance zwischen Schutz und Praktikabilitaet).
+
 ## Kamera- und Emotionslogik
 
 ### Testmodus
