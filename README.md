@@ -139,6 +139,13 @@ TuxGuard bietet drei distinct Sicherheitsmodi, die in den UI-Einstellungen konfi
    - **`suspend`**: System wird in den Ruhezustand versetzt (ACPI S3/S4).
    - **`shutdown`**: System wird heruntergefahren.
 
+**Unterschied zu self_unlock/strict_pin:**
+
+- `self_unlock` und `strict_pin`: Keine Erkennung → UI wird nach **10 Sekunden** gesperrt (Screen Lock), System läuft noch im Hintergrund.
+- `deadman`: Keine Erkennung → Nach **60 Sekunden** wird das **ganze System** suspend/shutdown erzwungen (nicht nur UI).
+
+Deadman ist deutlich aggressiver und ideal für Situationen, wo der Rechner **physisch komplett unauffindbar** sein muss (z. B. Raum verlassen, Kamera-Ausfall-Fallback).
+
 **Konfiguration:**
 - Timeout: `DEADMAN_TIMEOUT_SECONDS` (in `TuxGuard(1.0.0)/config.py`, Default 60 Sekunden)
 - Aktion: `DEADMAN_ACTION` (in `TuxGuard(1.0.0)/config.py`, Default "suspend")
