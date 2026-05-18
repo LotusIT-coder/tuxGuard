@@ -53,29 +53,50 @@ class ScrollFrame(Frame):
         # Scrollbar verbinden
         self.canvas.configure(yscrollcommand=scrollbar.set)
         
-        # Mousewheel Scrolling
-        self.content_frame.bind("<MouseWheel>", self._on_mousewheel)
-        self.content_frame.bind("<Button-4>", self._on_mousewheel)
-        self.content_frame.bind("<Button-5>", self._on_mousewheel)
+        # Mousewheel Scrolling (Linux + Windows)
+        self.canvas.bind("<Enter>", self._bind_mousewheel)
+        self.canvas.bind("<Leave>", self._unbind_mousewheel)
+        self.content_frame.bind("<Enter>", self._bind_mousewheel)
+        self.content_frame.bind("<Leave>", self._unbind_mousewheel)
         
         # Update scroll region wenn Content ändert
         self.content_frame.bind("<Configure>", self._on_frame_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
         
         # Packing
         self.canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+
+        # Initiale Geometrie sauber setzen, damit der Inhalt sofort sichtbar ist
+        self.after_idle(self._on_frame_configure)
     
     def _on_frame_configure(self, event=None):
         """Update scroll region wenn Frame ändert"""
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        # Canvas width = content width
-        self.canvas.itemconfigure(self.window, width=self.canvas.winfo_width())
+
+    def _on_canvas_configure(self, event=None):
+        """Hält das eingebettete Content-Frame auf Canvas-Breite."""
+        width = self.canvas.winfo_width()
+        if width > 1:
+            self.canvas.itemconfigure(self.window, width=width)
+
+    def _bind_mousewheel(self, _event=None):
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind_all("<Button-4>", self._on_mousewheel)
+        self.canvas.bind_all("<Button-5>", self._on_mousewheel)
+
+    def _unbind_mousewheel(self, _event=None):
+        self.canvas.unbind_all("<MouseWheel>")
+        self.canvas.unbind_all("<Button-4>")
+        self.canvas.unbind_all("<Button-5>")
     
     def _on_mousewheel(self, event):
         """Mousewheel Scrolling"""
-        if event.num == 5 or event.delta < 0:
+        delta = getattr(event, "delta", 0)
+        num = getattr(event, "num", None)
+        if num == 5 or delta < 0:
             self.canvas.yview_scroll(3, "units")
-        elif event.num == 4 or event.delta > 0:
+        elif num == 4 or delta > 0:
             self.canvas.yview_scroll(-3, "units")
 
 class SimplePinDialog:
@@ -86,8 +107,8 @@ class SimplePinDialog:
         self.parent = parent
         self.title = title
         self.reason = reason
-        self.result = None
-        self.dialog = None
+        self.result: Optional[str] = None
+        self.dialog: Optional[tk.Toplevel] = None
     
     def show(self) -> Optional[str]:
         """Zeigt den PIN-Dialog"""
@@ -154,24 +175,26 @@ class SimplePinDialog:
     def _ok(self):
         self.result = self.pin_entry.get()
         self.pin_entry.delete(0, tk.END)
-        self.dialog.destroy()
+        if self.dialog:
+            self.dialog.destroy()
     
     def _cancel(self):
         self.result = None
         if hasattr(self, 'pin_entry'):
             self.pin_entry.delete(0, tk.END)
-        self.dialog.destroy()
+        if self.dialog:
+            self.dialog.destroy()
 
 class SimpleUserListWidget:
     """Vereinfachtes Benutzer-Listen-Widget"""
     
     def __init__(self, parent):
         self.parent = parent
-        self.listbox = None
-        self.user_names = []
-        self.show_images_callback = None
-        self.add_images_callback = None
-        self.delete_user_callback = None
+        self.listbox: Optional[Listbox] = None
+        self.user_names: List[str] = []
+        self.show_images_callback: Optional[Callable] = None
+        self.add_images_callback: Optional[Callable] = None
+        self.delete_user_callback: Optional[Callable] = None
         self._create_widgets()
     
     def _create_widgets(self):
@@ -187,13 +210,20 @@ class SimpleUserListWidget:
         
         # Kontext-Menü
         self.context_menu = Menu(container, tearoff=0)
-        self.context_menu.add_command(label="Bilder anzeigen", command=self._show_images)
-        self.context_menu.add_command(label="Bilder hinzufügen", command=self._add_images)
+
+        # Untermenü für Bilder verwalten
+        self.images_menu = Menu(self.context_menu, tearoff=0)
+        self.images_menu.add_command(label="Bilder anzeigen", command=self._show_images)
+        self.images_menu.add_command(label="Bilder hinzufügen", command=self._add_images)
+
+        self.context_menu.add_cascade(label="Bilder verwalten", menu=self.images_menu)
         self.context_menu.add_command(label="Benutzer löschen", command=self._delete_user)
         
         self.listbox.bind("<Button-3>", self._show_context_menu)
     
     def _show_context_menu(self, event):
+        if not self.listbox:
+            return
         try:
             self.listbox.selection_clear(0, tk.END)
             self.listbox.selection_set(self.listbox.nearest(event.y))
@@ -217,6 +247,8 @@ class SimpleUserListWidget:
             self.delete_user_callback(user_name)
 
     def _selected_user_name(self) -> Optional[str]:
+        if not self.listbox:
+            return None
         selection = self.listbox.curselection()
         if not selection:
             return None
@@ -227,6 +259,8 @@ class SimpleUserListWidget:
     
     def refresh(self, users: List[str]):
         self.user_names = list(users)
+        if not self.listbox:
+            return
         self.listbox.delete(0, tk.END)
         for user in users:
             self.listbox.insert(tk.END, f"👤 {user}")
@@ -322,18 +356,19 @@ class SimpleMainUI:
         self.callbacks = {}
         self.control_buttons = {}
         self.status_indicators = {}
-        self.user_list_widget = None
-        self.security_log_widget = None
-        self.security_mode_var = None
-        self.deadman_timeout_var = None
-        self.deadman_action_var = None
-        self.deadman_timeout_row = None
-        self.deadman_action_row = None
-        self.minimize_behavior_var = None
-        self.close_behavior_var = None
-        self.monitor_preview_label = None
+        self.user_list_widget: Optional[SimpleUserListWidget] = None
+        self.security_log_widget: Optional[SimpleLogWidget] = None
+        self.security_mode_var: Optional[tk.StringVar] = None
+        self.deadman_timeout_var: Optional[tk.StringVar] = None
+        self.deadman_action_var: Optional[tk.StringVar] = None
+        self.deadman_timeout_row: Optional[Frame] = None
+        self.deadman_action_row: Optional[Frame] = None
+        self.minimize_behavior_var: Optional[tk.StringVar] = None
+        self.close_behavior_var: Optional[tk.StringVar] = None
+        self.monitor_preview_label: Optional[Label] = None
         self.monitor_preview_image = None
-        self.monitor_preview_status_label = None
+        self.monitor_preview_status_label: Optional[Label] = None
+        self.autostart_callback: Optional[Callable] = None
         
         self._setup_window()
         self._create_widgets()
@@ -660,6 +695,8 @@ class SimpleMainUI:
     def _emit_security_settings(self):
         callback = self.callbacks.get("security_settings_changed")
         if callback:
+            if not (self.security_mode_var and self.deadman_timeout_var and self.deadman_action_var):
+                return
             try:
                 callback(
                     self.security_mode_var.get(),
@@ -672,6 +709,8 @@ class SimpleMainUI:
     def _emit_ui_behavior_settings(self):
         callback = self.callbacks.get("ui_behavior_changed")
         if callback:
+            if not (self.minimize_behavior_var and self.close_behavior_var):
+                return
             try:
                 callback(
                     self.minimize_behavior_var.get(),
@@ -869,13 +908,15 @@ class PasswordDialog:
     def _ok(self):
         self.result = self.password_entry.get()
         self.password_entry.delete(0, tk.END)
-        self.dialog.destroy()
+        if self.dialog:
+            self.dialog.destroy()
 
     def _cancel(self):
         self.result = None
         if hasattr(self, "password_entry"):
             self.password_entry.delete(0, tk.END)
-        self.dialog.destroy()
+        if self.dialog:
+            self.dialog.destroy()
 
 
 class LoginDialog:
@@ -941,14 +982,16 @@ class LoginDialog:
         password = self.password_entry.get()
         if not username or not password:
             messagebox.showerror("Fehler", "Bitte Benutzer und Passwort angeben.",
-                                 parent=self.dialog)
+                                 parent=self.dialog or self.parent)
             return
         self.result = (username, password)
-        self.dialog.destroy()
+        if self.dialog:
+            self.dialog.destroy()
 
     def _cancel(self):
         self.result = None
-        self.dialog.destroy()
+        if self.dialog:
+            self.dialog.destroy()
 
 
 class FirstRunWizard:
@@ -1055,7 +1098,7 @@ class FirstRunWizard:
         if not self.capture_face_callback:
             messagebox.showinfo("Webcam nicht verfügbar",
                                 "Webcam-Aufnahme ist nicht verfügbar. Bitte Datei wählen.",
-                                parent=self.dialog)
+                                parent=self.dialog or self.parent)
             return
         path = self.capture_face_callback()
         if path:
@@ -1070,7 +1113,7 @@ class FirstRunWizard:
         paths = filedialog.askopenfilenames(
             title="Gesichtsbild auswählen",
             filetypes=Config.IMAGE_FILE_TYPES,
-            parent=self.dialog,
+            parent=self.dialog or self.parent,
         )
         if paths:
             self._selected_image_paths = list(paths)
@@ -1087,29 +1130,29 @@ class FirstRunWizard:
 
         if not name:
             messagebox.showerror("Fehler", "Benutzername darf nicht leer sein.",
-                                 parent=self.dialog)
+                                 parent=self.dialog or self.parent)
             return
         if len(password) < Config.MIN_PASSWORD_LENGTH:
             messagebox.showerror(
                 "Fehler",
                 f"Passwort muss mindestens {Config.MIN_PASSWORD_LENGTH} Zeichen lang sein.",
-                parent=self.dialog)
+                parent=self.dialog or self.parent)
             return
         if password != password2:
             messagebox.showerror("Fehler", "Passwörter stimmen nicht überein.",
-                                 parent=self.dialog)
+                                 parent=self.dialog or self.parent)
             return
         if len(pin) < Config.MIN_PIN_LENGTH:
             messagebox.showerror(
                 "Fehler",
                 f"PIN muss mindestens {Config.MIN_PIN_LENGTH} Zeichen lang sein.",
-                parent=self.dialog)
+                parent=self.dialog or self.parent)
             return
         if not self._selected_image_paths:
             messagebox.showerror(
                 "Fehler",
                 "Bitte mindestens ein Gesichtsbild bereitstellen.",
-                parent=self.dialog)
+                parent=self.dialog or self.parent)
             return
 
         self.result = {
@@ -1119,11 +1162,13 @@ class FirstRunWizard:
             "image_paths": list(self._selected_image_paths),
             "captured_image": self._captured_image_path,
         }
-        self.dialog.destroy()
+        if self.dialog:
+            self.dialog.destroy()
 
     def _cancel(self):
         self.result = None
-        self.dialog.destroy()
+        if self.dialog:
+            self.dialog.destroy()
 
 
 class MasterPasswordSetupDialog:
@@ -1185,14 +1230,15 @@ class MasterPasswordSetupDialog:
             messagebox.showerror(
                 "Fehler",
                 f"Passwort muss mindestens {Config.MIN_PASSWORD_LENGTH} Zeichen lang sein.",
-                parent=self.dialog)
+                parent=self.dialog or self.parent)
             return
         if a != b:
             messagebox.showerror("Fehler", "Passwörter stimmen nicht überein.",
-                                 parent=self.dialog)
+                                 parent=self.dialog or self.parent)
             return
         self.result = a
-        self.dialog.destroy()
+        if self.dialog:
+            self.dialog.destroy()
 
 
 def show_recovery_code(parent: tk.Tk, code: str, title: str = "Recovery-Code") -> None:

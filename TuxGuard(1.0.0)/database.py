@@ -508,6 +508,23 @@ class DatabaseManager:
             logger.error(f"Fehler beim Löschen des Gesichtsbildes: {e}")
             raise DatabaseError(f"Gesichtsbild konnte nicht gelöscht werden: {e}")
     
+    def get_face_encoding_ids(self, user_name: str) -> list[int]:
+        """Gibt eine Liste aller Gesichtsbild-IDs eines Benutzers zurück."""
+        self._ensure_connected()
+        try:
+            self.cursor.execute(
+                """
+                SELECT id FROM face_encodings 
+                WHERE user_id = (SELECT id FROM users WHERE name = ?)
+                """,
+                (user_name,)
+            )
+            rows = self.cursor.fetchall()
+            return [row[0] for row in rows]
+        except Exception as e:
+            logger.error(f"Fehler beim Abrufen der Gesichtsbild-IDs: {e}")
+            raise DatabaseError(f"Gesichtsbild-IDs konnten nicht abgerufen werden: {e}")
+    
     def __enter__(self):
         """Context Manager Eintritt"""
         self.connect()

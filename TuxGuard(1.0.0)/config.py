@@ -69,8 +69,8 @@ class Config:
     EMOTION_ALERT_DURATION_SECONDS = 3.0
     EMOTION_ALERT_MIN_CONFIDENCE = 0.35
     
-    # Logging (relativ zum Installationsverzeichnis)
-    LOGS_DIR = _SCRIPT_DIR / "logs"
+    # Logging
+    LOGS_DIR = Path("/var/log/tuxguard")
     LOG_FILE = LOGS_DIR / "tuxguard.log"
     ERROR_LOG_FILE = LOGS_DIR / "error.log"
     LOG_MAX_BYTES = 10 * 1024 * 1024  # 10MB

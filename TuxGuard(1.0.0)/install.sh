@@ -15,7 +15,13 @@ apt-get install -y python3 python3-venv python3-tk git i3lock v4l-utils lsof
 echo "Erstelle Programmverzeichnis..."
 install -d /opt/tuxguard
 install -d /opt/tuxguard/models
-install -d /opt/tuxguard/logs
+
+# Erstelle Log-Verzeichnis
+echo "Erstelle Log-Verzeichnis..."
+install -d -m 755 /var/log/tuxguard
+if [ -n "$SUDO_USER" ]; then
+    chown "$SUDO_USER:$SUDO_USER" /var/log/tuxguard
+fi
 
 # Hinweis: Die Gesichtserkennung läuft standardmäßig über die robusten
 # OpenCV-Haar-Cascades (Frontal + Profil + Spiegel + Rotationen + CLAHE).
