@@ -28,7 +28,7 @@ class Config:
     MIN_PASSWORD_LENGTH = 8
     PBKDF2_ITERATIONS = 100_000
     SECURITY_MODE = "strict_pin"
-    DEADMAN_TIMEOUT_SECONDS = 60
+    DEADMAN_TIMEOUT_SECONDS = 30
     DEADMAN_ACTION = "suspend"
 
     # Auto-Lock nach fehlender Erkennung (Sekunden)

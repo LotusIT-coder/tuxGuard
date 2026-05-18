@@ -127,7 +127,7 @@ TuxGuard bietet drei distinct Sicherheitsmodi, die in den UI-Einstellungen konfi
 
 **Konzept:**
 - Ein Totmannschalter (Deadman's Switch) ist eine Failsafe-Komponente, die automatisch eine Schutzaktion ausloest, wenn kein explizites Signal mehr eingeht.
-- In TuxGuard: Wenn ueber einen konfigurierbaren Zeitraum (Default: 60 Sekunden) KEINE legitimen Benutzer erkannt werden, wird eine Aktion erzwungen.
+- In TuxGuard: Wenn ueber einen konfigurierbaren Zeitraum (Default: 30 Sekunden) KEINE legitimen Benutzer erkannt werden, wird eine Aktion erzwungen.
 
 **Verhalten:**
 1. Ueberwachung startet.
@@ -142,12 +142,12 @@ TuxGuard bietet drei distinct Sicherheitsmodi, die in den UI-Einstellungen konfi
 **Unterschied zu self_unlock/strict_pin:**
 
 - `self_unlock` und `strict_pin`: Keine Erkennung → UI wird nach **10 Sekunden** gesperrt (Screen Lock), System läuft noch im Hintergrund.
-- `deadman`: Keine Erkennung → Nach **60 Sekunden** wird das **ganze System** suspend/shutdown erzwungen (nicht nur UI).
+- `deadman`: Keine Erkennung → Nach **30 Sekunden** wird das **ganze System** suspend/shutdown erzwungen (nicht nur UI).
 
 Deadman ist deutlich aggressiver und ideal für Situationen, wo der Rechner **physisch komplett unauffindbar** sein muss (z. B. Raum verlassen, Kamera-Ausfall-Fallback).
 
 **Konfiguration:**
-- Timeout: `DEADMAN_TIMEOUT_SECONDS` (in `TuxGuard(1.0.0)/config.py`, Default 60 Sekunden)
+- Timeout: `DEADMAN_TIMEOUT_SECONDS` (in `TuxGuard(1.0.0)/config.py`, Default 30 Sekunden)
 - Aktion: `DEADMAN_ACTION` (in `TuxGuard(1.0.0)/config.py`, Default "suspend")
 - Einstellbar in der UI unter "Sicherheitsmodus" (erfordert Master-Passwort)
 
