@@ -48,6 +48,9 @@ class Config:
     # Modell-Pfade (relativ zum Installationsverzeichnis)
     MODELS_DIR = _SCRIPT_DIR / "models"
     FACE_LANDMARKER_MODEL = MODELS_DIR / "face_landmarker_v2.task"
+
+    # Gesichtsabgleich: maximale Distanz zwischen Kodierungen (kleiner = strenger)
+    FACE_MATCH_TOLERANCE = 0.9
     
     # Adaptives Lernen
     ADAPTIVE_RETRAIN_INTERVAL = 10
@@ -75,6 +78,7 @@ class Config:
     ERROR_LOG_FILE = LOGS_DIR / "error.log"
     LOG_MAX_BYTES = 10 * 1024 * 1024  # 10MB
     LOG_BACKUP_COUNT = 5
+    USER_RECOGNIZED_LOG_INTERVAL_SECONDS = 5.0
     
     # UI Einstellungen
     WINDOW_TITLE = f"{APP_NAME} v{APP_VERSION}"

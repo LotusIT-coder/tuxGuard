@@ -74,6 +74,10 @@ class CameraManager:
         
         # Dialoge
         self.permission_dialog = None
+        self.user_recognized_log_interval_seconds = float(
+            getattr(Config, "USER_RECOGNIZED_LOG_INTERVAL_SECONDS", 5.0)
+        )
+        self._last_user_recognized_log_at: Dict[str, float] = {}
 
         # Emotions-Overlay (rein visuell, keine Persistenz)
         self.emotion_analysis_enabled = bool(getattr(Config, "EMOTION_ANALYSIS_ENABLED", True))
@@ -185,16 +189,21 @@ class CameraManager:
                     emotions.append({"label": "unknown", "confidence": 0.0, "source": "onnx_error"})
                     continue
                 
+                # Eingabebild ist bereits RGB (rgb_frame) – keine Konvertierung nötig.
                 face_crop_resized = cv2.resize(face_crop, (224, 224))
-                face_crop_rgb = cv2.cvtColor(face_crop_resized, cv2.COLOR_BGR2RGB) if len(face_crop_resized.shape) == 3 else face_crop_resized
-                input_data = np.expand_dims(face_crop_rgb.astype(np.float32) / 255.0, 0)
+                input_data = np.expand_dims(face_crop_resized.astype(np.float32) / 255.0, 0)
                 
                 input_name = self._onnx_session.get_inputs()[0].name
                 output_name = self._onnx_session.get_outputs()[0].name
                 logits = self._onnx_session.run([output_name], {input_name: input_data})[0]
                 
+                # Logits über Softmax in Wahrscheinlichkeiten umrechnen.
+                logits_vec = np.asarray(logits[0], dtype=np.float64)
+                exp = np.exp(logits_vec - logits_vec.max())
+                probs = exp / max(1e-12, exp.sum())
+
                 emotion_labels = ["angry", "disgusted", "fearful", "happy", "neutral", "sad", "surprised"]
-                scores = dict(zip(emotion_labels, logits[0].tolist()))
+                scores = dict(zip(emotion_labels, probs.tolist()))
                 best_label = max(scores, key=scores.get)
                 best_confidence = float(scores[best_label])
                 
@@ -206,7 +215,7 @@ class CameraManager:
                         "scores": scores,
                     })
                 else:
-                    emotions.append({"label": "unknown", "confidence": 0.0, "source": "onnx"})
+                    emotions.append({"label": "unknown", "confidence": best_confidence, "source": "onnx", "scores": scores})
             except Exception as exc:
                 logger.debug(f"ONNX-Inferenz für Face fehlgeschlagen: {exc}")
                 emotions.append({"label": "unknown", "confidence": 0.0, "source": "onnx_error"})
@@ -430,6 +439,7 @@ class CameraManager:
         self.last_state = None
         self.state_since = time.time()
         self.state_candidate = None
+        self._last_user_recognized_log_at.clear()
         self._emotion_tracks.clear()
         self._next_emotion_track_id = 1
         self._emotion_alert_candidate = None
@@ -619,16 +629,17 @@ class CameraManager:
             label = str(smoothed.get("label", "unknown") or "unknown")
             confidence = float(smoothed.get("confidence", 0.0) or 0.0)
             scores = raw.get("scores", {}) if isinstance(raw, dict) else {}
+            # "scores" sind normalisierte Wahrscheinlichkeiten (Summe = 1).
             fear_score = float(scores.get("fearful", 0.0) or 0.0)
             surprise_score = float(scores.get("surprised", 0.0) or 0.0)
 
-            if (label == "fearful" and confidence >= 0.55) or (fear_score >= 0.55 and surprise_score >= 0.35):
+            if (label == "fearful" and confidence >= 0.60) or (fear_score >= 0.45 and surprise_score >= 0.20):
                 return "panik"
             if label == "fearful" and confidence >= self.emotion_alert_min_confidence:
                 return "angst"
-            if fear_score >= 0.30 and surprise_score >= 0.25:
+            if fear_score >= 0.25 and surprise_score >= 0.15:
                 return "nervositaet"
-            if (label in {"sad", "fearful", "unknown"} and confidence >= self.emotion_alert_min_confidence):
+            if label in {"sad", "fearful"} and confidence >= self.emotion_alert_min_confidence:
                 return "unsicherheit"
         return None
 
@@ -690,17 +701,24 @@ class CameraManager:
 
             if face_encodings:
                 known_encodings = self.db_manager.get_all_face_encodings()
+                tolerance = float(getattr(Config, "FACE_MATCH_TOLERANCE", 0.9))
 
                 for face_encoding in face_encodings:
                     current_name = "Unbekannt"
+                    # Best-Match: kleinste Distanz über ALLE bekannten
+                    # Kodierungen statt erstem Treffer unter der Toleranz.
+                    best_name = None
+                    best_distance = float("inf")
                     for name, known_encoding, desc in known_encodings:
-                        matches = compare_faces([known_encoding], face_encoding)
-                        if matches and matches[0]:
-                            user_recognized = True
-                            recognized_user = name
-                            current_name = name
-                            logger.info(f"Benutzer erkannt: {name}")
-                            break
+                        distances = face_distance([known_encoding], face_encoding)
+                        if distances.size and float(distances[0]) < best_distance:
+                            best_distance = float(distances[0])
+                            best_name = name
+                    if best_name is not None and best_distance <= tolerance:
+                        user_recognized = True
+                        recognized_user = best_name
+                        current_name = best_name
+                        self._log_user_recognized_throttled(best_name)
                     face_names.append(current_name)
 
                     if user_recognized:
@@ -753,6 +771,14 @@ class CameraManager:
             logger.error(f"Fehler in Kameraüberwachung: {e}\n{traceback.format_exc()}")
 
         self.camera_after_id = self.parent_window.after(100, self._run_camera_step)
+
+    def _log_user_recognized_throttled(self, user_name: str) -> None:
+        now = time.time()
+        min_interval = max(0.0, self.user_recognized_log_interval_seconds)
+        last_log_at = self._last_user_recognized_log_at.get(user_name)
+        if last_log_at is None or (now - last_log_at) >= min_interval:
+            logger.info(f"Benutzer erkannt: {user_name}")
+            self._last_user_recognized_log_at[user_name] = now
     
     def capture_image(self) -> Optional[str]:
         """Nimmt ein Bild mit der Webcam auf und gibt den Pfad zurück.
@@ -1020,7 +1046,8 @@ class CameraManager:
                 for face_encoding in face_encodings:
                     name = "Unbekannt"
                     if known_encodings:
-                        matches = compare_faces(known_encodings, face_encoding, tolerance=0.9)
+                        tolerance = float(getattr(Config, "FACE_MATCH_TOLERANCE", 0.9))
+                        matches = compare_faces(known_encodings, face_encoding, tolerance=tolerance)
                         face_distances = face_distance(known_encodings, face_encoding)
                         if len(face_distances) > 0:
                             best_match_index = int(np.argmin(face_distances))

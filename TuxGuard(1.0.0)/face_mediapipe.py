@@ -42,7 +42,14 @@ logger = logging.getLogger("TuxGuard.FaceBackend")
 _WORKER_SCRIPT = Path(__file__).with_name("face_mediapipe_worker.py")
 
 _MODEL_FILENAME = "face_landmarker_v2.task"
-_MODEL_URL = "https://storage.googleapis.com/mediapipe-assets/face_landmarker_v2.task"
+# Offizielles FaceLandmarker-Bundle MIT Blendshape-Submodell (~3,7 MB).
+# Achtung: Die ältere URL unter mediapipe-assets/face_landmarker_v2.task
+# liefert eine Variante OHNE Blendshapes (~1,4 MB), mit der weder
+# Emotionserkennung noch output_face_blendshapes=True funktionieren.
+_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/1/face_landmarker.task"
+)
 
 # Kanonisches Ausgabeformat für die ausgerichtete Gesichtsregion.
 _CANONICAL_SIZE = 96
@@ -120,6 +127,21 @@ _MP_LANDMARKER = None
 _MP_LOCK = threading.Lock()
 _MP_AVAILABLE: Optional[bool] = None  # tri-state: None=ungeprüft, True/False
 _MP_MODEL_PATH: Optional[Path] = None
+_MP_BLENDSHAPES = False  # True, wenn das geladene Modell Blendshapes liefert
+
+
+def _block_tensorflow_import() -> None:
+    """Verhindert, dass MediaPipe das volle TensorFlow-Paket mitlädt.
+
+    ``mediapipe.tasks`` importiert TensorFlow nur optional (für Doku-
+    Dekoratoren). Ist das volle TensorFlow-Paket installiert, kollidieren
+    dessen MLIR-Pass-Registries mit denen von MediaPipe und das Laden des
+    FaceLandmarker-Graphen endet in einem Segfault
+    ("Error: Required pass not found"). TuxGuard selbst nutzt TensorFlow
+    nicht, daher wird der Import prozessweit blockiert.
+    """
+    if "tensorflow" not in sys.modules:
+        sys.modules["tensorflow"] = None  # type: ignore[assignment]
 
 
 def _candidate_model_paths() -> List[Path]:
@@ -164,21 +186,18 @@ def _ensure_landmarker():
     Gibt das Landmarker-Objekt zurück oder ``None``, wenn MediaPipe nicht
     aktiviert oder nicht verfügbar ist.
 
-    MediaPipe ist standardmäßig **deaktiviert**, weil es in derselben
-    Python-Instanz wie TensorFlow zu Symbol-Konflikten (LLVM/TFLite
-    PassRegistry) und Segfaults führen kann. Aktivierung über Env-Var
-    ``TUXGUARD_USE_MEDIAPIPE=1`` – sinnvoll nur im isolierten Worker-
-    Subprozess (siehe ``face_mediapipe_worker.py``), der diese Variable
-    selbst setzt.
+    MediaPipe ist standardmäßig **aktiviert**. Bei Problemen kann es
+    über ``TUXGUARD_USE_MEDIAPIPE=0`` explizit deaktiviert werden.
     """
-    global _MP_LANDMARKER, _MP_AVAILABLE, _MP_MODEL_PATH
+    global _MP_LANDMARKER, _MP_AVAILABLE, _MP_MODEL_PATH, _MP_BLENDSHAPES
 
     if _MP_AVAILABLE is False:
         return None
     if _MP_LANDMARKER is not None:
         return _MP_LANDMARKER
 
-    if os.environ.get("TUXGUARD_USE_MEDIAPIPE", "0") not in ("1", "true", "yes"):
+    use_mp = str(os.environ.get("TUXGUARD_USE_MEDIAPIPE", "1") or "1").strip().lower()
+    if use_mp in ("0", "false", "no"):
         _MP_AVAILABLE = False
         return None
 
@@ -188,6 +207,7 @@ def _ensure_landmarker():
         if _MP_AVAILABLE is False:
             return None
 
+        _block_tensorflow_import()
         try:
             from mediapipe.tasks import python as mp_python
             from mediapipe.tasks.python import vision as mp_vision
@@ -204,27 +224,66 @@ def _ensure_landmarker():
             _MP_AVAILABLE = False
             return None
 
-        try:
-            base_options = mp_python.BaseOptions(model_asset_path=str(model_path))
+        def _create(path: Path, with_blendshapes: bool):
             options = mp_vision.FaceLandmarkerOptions(
-                base_options=base_options,
+                base_options=mp_python.BaseOptions(model_asset_path=str(path)),
                 running_mode=mp_vision.RunningMode.IMAGE,
                 num_faces=4,
                 min_face_detection_confidence=0.3,
                 min_face_presence_confidence=0.3,
                 min_tracking_confidence=0.3,
-                output_face_blendshapes=True,
+                output_face_blendshapes=with_blendshapes,
                 output_facial_transformation_matrixes=False,
             )
-            _MP_LANDMARKER = mp_vision.FaceLandmarker.create_from_options(options)
-            _MP_MODEL_PATH = model_path
-            _MP_AVAILABLE = True
-            logger.info("MediaPipe FaceLandmarker geladen (%s).", model_path)
-            return _MP_LANDMARKER
+            return mp_vision.FaceLandmarker.create_from_options(options)
+
+        landmarker = None
+        blendshapes = False
+        try:
+            landmarker = _create(model_path, True)
+            blendshapes = True
         except Exception as exc:  # pylint: disable=broad-except
-            logger.warning("FaceLandmarker konnte nicht initialisiert werden: %s", exc)
-            _MP_AVAILABLE = False
-            return None
+            if "blendshape" in str(exc).lower():
+                # Modell ohne Blendshape-Submodell (z. B. alte mediapipe-assets-
+                # Variante). Versuche, das vollständige Modell nachzuladen.
+                logger.warning(
+                    "Modell %s enthält kein Blendshape-Submodell – "
+                    "lade vollständiges Modell nach.", model_path,
+                )
+                fresh = _download_model_if_possible()
+                if fresh is not None:
+                    try:
+                        landmarker = _create(fresh, True)
+                        blendshapes = True
+                        model_path = fresh
+                    except Exception as exc2:  # pylint: disable=broad-except
+                        logger.warning("Nachgeladenes Modell fehlgeschlagen: %s", exc2)
+            else:
+                logger.warning("FaceLandmarker-Init mit Blendshapes fehlgeschlagen: %s", exc)
+
+        if landmarker is None:
+            # Letzter Versuch: ohne Blendshapes (Landmarks/Alignment bleiben
+            # nutzbar, nur die Emotionserkennung entfällt).
+            try:
+                landmarker = _create(model_path, False)
+                logger.warning(
+                    "FaceLandmarker ohne Blendshapes geladen – "
+                    "Emotionserkennung nicht verfügbar."
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning("FaceLandmarker konnte nicht initialisiert werden: %s", exc)
+                _MP_AVAILABLE = False
+                return None
+
+        _MP_LANDMARKER = landmarker
+        _MP_MODEL_PATH = model_path
+        _MP_BLENDSHAPES = blendshapes
+        _MP_AVAILABLE = True
+        logger.info(
+            "MediaPipe FaceLandmarker geladen (%s, Blendshapes=%s).",
+            model_path, blendshapes,
+        )
+        return _MP_LANDMARKER
 
 
 def _landmark_xy(
@@ -299,7 +358,13 @@ def _detect_with_mediapipe(
             if bbox[2] > bbox[0] and bbox[1] > bbox[3]:
                 blendshape_scores: Dict[str, float] = {}
                 if index < len(blendshapes_list):
-                    categories = getattr(blendshapes_list[index], "categories", []) or []
+                    entry = blendshapes_list[index]
+                    # Neue Tasks-API liefert direkt eine Liste von Category-
+                    # Objekten, ältere Versionen ein Objekt mit ``.categories``.
+                    if isinstance(entry, (list, tuple)):
+                        categories = entry
+                    else:
+                        categories = getattr(entry, "categories", []) or []
                     for category in categories:
                         name = str(getattr(category, "category_name", "") or "").strip()
                         if not name:
@@ -654,18 +719,26 @@ def compare_faces(
     return [float(distance) <= tolerance for distance in distances]
 
 
-def _mean_score(scores: Dict[str, float], keys: Sequence[str]) -> float:
-    values = [float(scores.get(key, 0.0)) for key in keys]
-    if not values:
-        return 0.0
-    return float(sum(values) / len(values))
+def _pair_score(scores: Dict[str, float], left: str, right: str) -> float:
+    """Maximum eines Links/Rechts-Blendshape-Paares.
+
+    ``max`` statt Mittelwert, damit auch einseitige Ausdrücke (z. B.
+    schiefes Lächeln) voll gewertet werden.
+    """
+    return max(float(scores.get(left, 0.0)), float(scores.get(right, 0.0)))
 
 
 def _infer_emotion_from_blendshapes(
     scores: Optional[Dict[str, float]],
     min_confidence: float,
 ) -> Dict[str, object]:
-    """Leitet eine grobe Emotion aus FaceBlendshape-Scores ab."""
+    """Leitet eine Emotion aus FaceBlendshape-Scores ab.
+
+    Verwendet gewichtete Kombinationen der relevanten Action Units mit
+    Gegen-Evidenz (z. B. dämpft ein Lächeln "angry"/"sad") und einem
+    dynamischen Neutral-Score. Die zurückgegebenen ``scores`` sind auf
+    Wahrscheinlichkeiten normalisiert (Summe = 1).
+    """
     if not scores:
         return {
             "label": "unknown",
@@ -674,46 +747,79 @@ def _infer_emotion_from_blendshapes(
             "scores": {},
         }
 
-    emotion_scores = {
-        "happy": _mean_score(scores, (
-            "mouthSmileLeft", "mouthSmileRight", "cheekSquintLeft", "cheekSquintRight"
-        )),
-        "sad": _mean_score(scores, (
-            "browInnerUp", "mouthFrownLeft", "mouthFrownRight"
-        )),
-        "angry": _mean_score(scores, (
-            "browDownLeft", "browDownRight", "noseSneerLeft", "noseSneerRight", "jawForward"
-        )),
-        "surprised": _mean_score(scores, (
-            "jawOpen", "eyeWideLeft", "eyeWideRight", "browOuterUpLeft", "browOuterUpRight"
-        )),
-        "fearful": _mean_score(scores, (
-            "eyeWideLeft", "eyeWideRight", "mouthStretchLeft", "mouthStretchRight", "browInnerUp"
-        )),
-        "disgusted": _mean_score(scores, (
-            "noseSneerLeft", "noseSneerRight", "mouthUpperUpLeft", "mouthUpperUpRight"
-        )),
-        "neutral": 0.2,
+    def s(name: str) -> float:
+        return float(scores.get(name, 0.0))
+
+    smile = _pair_score(scores, "mouthSmileLeft", "mouthSmileRight")
+    frown = _pair_score(scores, "mouthFrownLeft", "mouthFrownRight")
+    brow_down = _pair_score(scores, "browDownLeft", "browDownRight")
+    brow_inner_up = s("browInnerUp")
+    brow_outer_up = _pair_score(scores, "browOuterUpLeft", "browOuterUpRight")
+    eye_wide = _pair_score(scores, "eyeWideLeft", "eyeWideRight")
+    eye_squint = _pair_score(scores, "eyeSquintLeft", "eyeSquintRight")
+    cheek_squint = _pair_score(scores, "cheekSquintLeft", "cheekSquintRight")
+    jaw_open = s("jawOpen")
+    mouth_press = _pair_score(scores, "mouthPressLeft", "mouthPressRight")
+    mouth_stretch = _pair_score(scores, "mouthStretchLeft", "mouthStretchRight")
+    nose_sneer = _pair_score(scores, "noseSneerLeft", "noseSneerRight")
+    upper_lip_up = _pair_score(scores, "mouthUpperUpLeft", "mouthUpperUpRight")
+    lower_lip_down = _pair_score(scores, "mouthLowerDownLeft", "mouthLowerDownRight")
+    mouth_shrug_lower = s("mouthShrugLower")
+
+    raw = {
+        "happy": (
+            1.2 * smile + 0.4 * cheek_squint + 0.2 * eye_squint
+            - 0.8 * frown - 0.3 * brow_down
+        ),
+        "sad": (
+            1.0 * frown + 0.7 * brow_inner_up + 0.4 * mouth_shrug_lower
+            - 1.2 * smile - 0.3 * jaw_open - 0.3 * eye_wide
+        ),
+        "angry": (
+            1.1 * brow_down + 0.3 * eye_squint + 0.4 * mouth_press
+            + 0.4 * nose_sneer - 1.0 * smile
+        ),
+        "surprised": (
+            0.9 * jaw_open + 0.9 * brow_outer_up + 0.6 * eye_wide
+            - 0.8 * brow_down - 0.6 * smile
+        ),
+        "fearful": (
+            0.9 * eye_wide + 0.7 * mouth_stretch + 0.6 * brow_inner_up
+            + 0.2 * jaw_open - 1.0 * smile - 0.4 * brow_down
+        ),
+        "disgusted": (
+            1.1 * nose_sneer + 0.7 * upper_lip_up + 0.3 * lower_lip_down
+            - 0.8 * smile
+        ),
     }
 
-    total = float(sum(max(0.0, val) for val in emotion_scores.values()))
-    if total <= 1e-8:
-        return {
-            "label": "unknown",
-            "confidence": 0.0,
-            "source": "blendshape",
-            "scores": emotion_scores,
-        }
+    # Stärkste beobachtete Aktivierung – bei entspanntem Gesicht dominiert
+    # der Neutral-Score, bei deutlicher Mimik fällt er schnell ab.
+    activation = max(
+        smile, frown, brow_down, brow_inner_up, brow_outer_up,
+        eye_wide, jaw_open, nose_sneer, mouth_stretch, mouth_press,
+        upper_lip_up,
+    )
+    raw["neutral"] = max(0.0, 0.6 - 1.2 * activation)
 
-    best_label, best_score = max(emotion_scores.items(), key=lambda item: item[1])
-    confidence = float(max(0.0, min(1.0, best_score / total)))
+    clipped = {label: max(0.0, value) for label, value in raw.items()}
+    total = float(sum(clipped.values()))
+    if total <= 1e-8:
+        # Keine Evidenz für irgendetwas → neutral.
+        probs = {label: 0.0 for label in clipped}
+        probs["neutral"] = 1.0
+    else:
+        probs = {label: value / total for label, value in clipped.items()}
+
+    best_label, best_prob = max(probs.items(), key=lambda item: item[1])
+    confidence = float(max(0.0, min(1.0, best_prob)))
     label = best_label if confidence >= min_confidence else "unknown"
 
     return {
         "label": label,
         "confidence": confidence,
         "source": "blendshape",
-        "scores": emotion_scores,
+        "scores": probs,
     }
 
 
@@ -823,4 +929,5 @@ def backend_info() -> dict:
         "backend": "mediapipe" if landmarker is not None else "opencv-cascade",
         "model_path": str(_MP_MODEL_PATH) if _MP_MODEL_PATH else None,
         "available": bool(landmarker is not None),
+        "blendshapes": bool(_MP_BLENDSHAPES),
     }
