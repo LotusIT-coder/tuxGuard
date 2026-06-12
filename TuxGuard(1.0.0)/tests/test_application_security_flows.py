@@ -108,6 +108,71 @@ class DummyRoot:
         self.topmost_values.append((name, value))
 
 
+class DummyLockWindow:
+    def __init__(self, *args, **kwargs):
+        self.title_value = None
+        self.geometry_value = None
+        self.overrideredirect_value = None
+        self.attributes_calls = []
+        self.configure_kwargs = {}
+        self.protocols = {}
+        self.bindings = {}
+        self.focus_forced = False
+        self.grab_set_called = False
+        self.grab_release_called = False
+        self.destroy_called = False
+
+    def title(self, value):
+        self.title_value = value
+
+    def geometry(self, value):
+        self.geometry_value = value
+
+    def overrideredirect(self, value):
+        self.overrideredirect_value = value
+
+    def attributes(self, name, value=None):
+        self.attributes_calls.append((name, value))
+
+    def configure(self, **kwargs):
+        self.configure_kwargs.update(kwargs)
+
+    def protocol(self, name, callback):
+        self.protocols[name] = callback
+
+    def bind(self, sequence, callback):
+        self.bindings[sequence] = callback
+
+    def focus_force(self):
+        self.focus_forced = True
+
+    def grab_set(self):
+        self.grab_set_called = True
+
+    def grab_release(self):
+        self.grab_release_called = True
+
+    def destroy(self):
+        self.destroy_called = True
+
+
+class DummyContainer:
+    def __init__(self, *args, **kwargs):
+        self.pack_calls = []
+
+    def pack(self, *args, **kwargs):
+        self.pack_calls.append((args, kwargs))
+
+
+class DummyLabel(DummyContainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.config_calls = []
+
+    def config(self, **kwargs):
+        self.config_calls.append(kwargs)
+
+
 @pytest.fixture
 def app():
     app = object.__new__(TuxGuardApplication)
@@ -131,6 +196,7 @@ def app():
     app.security_lock_delay_seconds = 10
     app.deadman_timeout_seconds = 60
     app.deadman_action = "suspend"
+    app.lock_target = "screen"
     app.security_lock_active = False
     app.security_lock_window = None
     app.security_lock_status_label = None
@@ -300,6 +366,47 @@ def test_prompt_lock_unlock_uses_admin_password(monkeypatch, app):
     app.master_auth.verify_admin_password.assert_called_once_with("admin-pass")
     app._release_security_lock.assert_called_once_with("Admin")
     assert app.deadman_triggered is False
+
+
+def test_activate_security_lock_creates_one_overlay_per_monitor(monkeypatch, app):
+    monkeypatch.setattr(app_module.tk, "Toplevel", DummyLockWindow)
+    monkeypatch.setattr(app_module.tk, "Frame", DummyContainer)
+    monkeypatch.setattr(app_module.tk, "Label", DummyLabel)
+    app._get_security_lock_geometries = Mock(return_value=[(0, 0, 1920, 1080), (1920, 0, 1920, 1080)])
+    app._activate_security_lock = TuxGuardApplication._activate_security_lock.__get__(app, TuxGuardApplication)
+    app._update_security_lock_status = TuxGuardApplication._update_security_lock_status.__get__(app, TuxGuardApplication)
+
+    app._activate_security_lock("Multi-monitor test")
+
+    assert len(app.security_lock_windows) == 2
+    assert app.security_lock_window is app.security_lock_windows[0]
+    assert [window.geometry_value for window in app.security_lock_windows] == ["1920x1080+0+0", "1920x1080+1920+0"]
+    assert all(window.overrideredirect_value is True for window in app.security_lock_windows)
+    assert all(("-topmost", True) in window.attributes_calls for window in app.security_lock_windows)
+    assert all(window.grab_set_called is True for window in app.security_lock_windows)
+    assert len(app.security_lock_status_labels) == 2
+    assert all(label.config_calls[-1]["text"].startswith("Warte auf einen legitimen Nutzer.") for label in app.security_lock_status_labels)
+
+
+def test_release_security_lock_destroys_all_overlay_windows(monkeypatch, app):
+    monkeypatch.setattr(app_module.tk, "Toplevel", DummyLockWindow)
+    monkeypatch.setattr(app_module.tk, "Frame", DummyContainer)
+    monkeypatch.setattr(app_module.tk, "Label", DummyLabel)
+    app._get_security_lock_geometries = Mock(return_value=[(0, 0, 800, 600), (800, 0, 800, 600)])
+    app._activate_security_lock = TuxGuardApplication._activate_security_lock.__get__(app, TuxGuardApplication)
+    app._release_security_lock = TuxGuardApplication._release_security_lock.__get__(app, TuxGuardApplication)
+    app._update_security_lock_status = TuxGuardApplication._update_security_lock_status.__get__(app, TuxGuardApplication)
+
+    app._activate_security_lock("Release test")
+    windows = list(app.security_lock_windows)
+
+    app._release_security_lock("Admin")
+
+    assert all(window.grab_release_called is True for window in windows)
+    assert all(window.destroy_called is True for window in windows)
+    assert app.security_lock_windows == []
+    assert app.security_lock_status_labels == []
+    app.ui.add_security_log.assert_called_once()
 
 
 def test_on_user_seen_self_unlock_skips_auto_release_when_admin_unlock_required(app):

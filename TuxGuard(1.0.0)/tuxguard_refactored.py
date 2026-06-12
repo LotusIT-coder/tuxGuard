@@ -11,6 +11,7 @@ import threading
 import tempfile
 import os
 import logging
+import re
 import io
 from pathlib import Path
 from typing import Optional, List
@@ -92,7 +93,9 @@ class TuxGuardApplication:
         self.security_lock_active = False
         self.security_lock_reason = ""
         self.security_lock_window = None
+        self.security_lock_windows: List[tk.Toplevel] = []
         self.security_lock_status_label = None
+        self.security_lock_status_labels: List[tk.Label] = []
         self.security_lock_unlock_pending = False
         self.strict_unlock_prompt_active = False
         self.force_admin_unlock_required = False
@@ -627,15 +630,93 @@ class TuxGuardApplication:
         if self.lock_target == "computer":
             self._lock_system_session()
 
+        self.security_lock_windows = []
+        self.security_lock_status_labels = []
+        for index, geometry in enumerate(self._get_security_lock_geometries()):
+            window, status_label = self._create_security_lock_window(geometry, reason)
+            self.security_lock_windows.append(window)
+            self.security_lock_status_labels.append(status_label)
+            if index == 0:
+                self.security_lock_window = window
+                self.security_lock_status_label = status_label
+
+        if not self.security_lock_windows:
+            window, status_label = self._create_security_lock_window((0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()), reason)
+            self.security_lock_windows = [window]
+            self.security_lock_status_labels = [status_label]
+            self.security_lock_window = window
+            self.security_lock_status_label = status_label
+
+        # Bei erzwungenem Admin-Entsperren (z.B. kein Benutzer vorhanden)
+        # ist nur der Admin-Passwort-Dialog erlaubt.
+        if self.force_admin_unlock_required:
+            for window in self.security_lock_windows:
+                for sequence in ("<Key>", "<Button-1>", "<Button-2>", "<Button-3>"):
+                    window.bind(sequence, lambda _e: self._prompt_lock_unlock())
+        # Bind: in strict_pin löst jede Taste/Maustaste den PIN-Prompt aus.
+        # In self_unlock erfolgt die Entsperrung automatisch durch Gesichtserkennung.
+        elif self.security_mode == "strict_pin":
+            def _trigger_unlock(_event=None):
+                self._prompt_strict_unlock(self.current_user)
+
+            for window in self.security_lock_windows:
+                for sequence in ("<Key>", "<Button-1>", "<Button-2>", "<Button-3>"):
+                    window.bind(sequence, _trigger_unlock)
+
+        self._update_security_lock_status()
+
+    def _get_security_lock_geometries(self):
+        """Ermittelt die Geometrien aller sichtbaren Bildschirme.
+
+        Unter Linux wird bevorzugt xrandr genutzt, damit das Overlay auf allen
+        angeschlossenen Displays erscheint. Fallback ist der bisherige
+        Einzeldisplay-Modus.
+        """
+        import shutil
+        import subprocess as sp
+
+        geometries = []
+        if os.environ.get("DISPLAY") and shutil.which("xrandr"):
+            try:
+                result = sp.run(["xrandr", "--query"], capture_output=True, text=True, check=False)
+                if result.returncode == 0:
+                    pattern = re.compile(
+                        r"^(?P<name>\S+)\s+connected(?:\s+primary)?\s+(?P<width>\d+)x(?P<height>\d+)\+(?P<x>-?\d+)\+(?P<y>-?\d+)"
+                    )
+                    for line in result.stdout.splitlines():
+                        match = pattern.match(line)
+                        if match:
+                            geometries.append(
+                                (
+                                    int(match.group("x")),
+                                    int(match.group("y")),
+                                    int(match.group("width")),
+                                    int(match.group("height")),
+                                )
+                            )
+            except Exception as exc:
+                self.logger.debug("xrandr-Monitorerkennung fehlgeschlagen: %s", exc)
+
+        if not geometries:
+            geometries.append((0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()))
+
+        return geometries
+
+    def _create_security_lock_window(self, geometry, reason: str):
+        """Erstellt ein Overlay-Fenster für einen Bildschirm."""
+        x_pos, y_pos, width, height = geometry
         window = tk.Toplevel(self.root)
         window.title("TuxGuard Sicherheitsmodus")
-        window.attributes("-fullscreen", True)
+        window.geometry(f"{width}x{height}+{x_pos}+{y_pos}")
+        try:
+            window.overrideredirect(True)
+        except Exception:
+            pass
         window.attributes("-topmost", True)
         window.configure(bg="black")
         window.protocol("WM_DELETE_WINDOW", lambda: None)
         window.bind("<Escape>", lambda _e: None)
         window.focus_force()
-        window.grab_set()
 
         content = tk.Frame(window, bg="black")
         content.pack(expand=True)
@@ -662,31 +743,17 @@ class TuxGuardApplication:
             bg="black",
         ).pack(pady=(0, 20))
 
-        self.security_lock_status_label = tk.Label(
+        status_label = tk.Label(
             content,
             font=("Arial", 13),
             fg="#cfe8ff",
             bg="black",
             justify=tk.CENTER,
         )
-        self.security_lock_status_label.pack()
+        status_label.pack()
 
-        # Bei erzwungenem Admin-Entsperren (z.B. kein Benutzer vorhanden)
-        # ist nur der Admin-Passwort-Dialog erlaubt.
-        if self.force_admin_unlock_required:
-            for sequence in ("<Key>", "<Button-1>", "<Button-2>", "<Button-3>"):
-                window.bind(sequence, lambda _e: self._prompt_lock_unlock())
-        # Bind: in strict_pin löst jede Taste/Maustaste den PIN-Prompt aus.
-        # In self_unlock erfolgt die Entsperrung automatisch durch Gesichtserkennung.
-        elif self.security_mode == "strict_pin":
-            def _trigger_unlock(_event=None):
-                self._prompt_strict_unlock(self.current_user)
-
-            for sequence in ("<Key>", "<Button-1>", "<Button-2>", "<Button-3>"):
-                window.bind(sequence, _trigger_unlock)
-
-        self.security_lock_window = window
-        self._update_security_lock_status()
+        window.grab_set()
+        return window, status_label
 
     def _lock_system_session(self):
         """Sperrt zusätzlich die Systemsitzung über loginctl/xdg-screensaver."""
@@ -730,7 +797,7 @@ class TuxGuardApplication:
 
     def _update_security_lock_status(self):
         """Aktualisiert den Hinweistext des Sperrbildschirms."""
-        if not self.security_lock_status_label:
+        if not self.security_lock_status_labels:
             return
 
         if self.security_mode == "deadman":
@@ -754,18 +821,24 @@ class TuxGuardApplication:
                     "Sobald die Kamera einen bekannten Nutzer erkennt,\n"
                     "erscheint die PIN-Abfrage zur Entsperrung.\n"
                     "Alternativ: beliebige Taste/Mausklick → PIN-Abfrage.")
-        self.security_lock_status_label.config(text=text)
+        for status_label in self.security_lock_status_labels:
+            status_label.config(text=text)
 
     def _release_security_lock(self, user_name: Optional[str] = None):
         """Hebt den Sperrbildschirm wieder auf."""
-        if self.security_lock_window is not None:
+        for window in self.security_lock_windows or ([self.security_lock_window] if self.security_lock_window is not None else []):
             try:
-                self.security_lock_window.grab_release()
+                window.grab_release()
             except Exception:
                 pass
-            self.security_lock_window.destroy()
+            try:
+                window.destroy()
+            except Exception:
+                pass
         self.security_lock_window = None
+        self.security_lock_windows = []
         self.security_lock_status_label = None
+        self.security_lock_status_labels = []
         self.security_lock_active = False
         self.security_lock_reason = ""
         self.strict_unlock_prompt_active = False
@@ -1413,7 +1486,7 @@ class TuxGuardApplication:
         except Exception as e:
             self.logger.error(f"Fehler beim Minimieren in Tray: {e}")
     
-    def _restore_from_tray(self):
+    def _restore_from_tray(self, icon=None, item=None):
         """Plant das Wiederherstellen aus der Systemleiste im Tk-Hauptthread."""
         self.root.after(0, self._show_restore_pin_dialog)
 
@@ -1442,11 +1515,11 @@ class TuxGuardApplication:
             self.tray_icon = None
         self.logger.info("Anwendung aus Tray wiederhergestellt")
     
-    def _toggle_monitoring_from_tray(self):
+    def _toggle_monitoring_from_tray(self, icon=None, item=None):
         """Schaltet Überwachung aus Tray um"""
         self.root.after(0, self._toggle_monitoring)
     
-    def _quit_from_tray(self):
+    def _quit_from_tray(self, icon=None, item=None):
         """Beendet Anwendung aus Tray"""
         self.root.after(0, self._show_quit_pin_dialog)
     
