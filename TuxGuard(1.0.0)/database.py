@@ -113,6 +113,27 @@ class DatabaseManager:
                 )
             """)
 
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS face_geometry_models (
+                    user_id INTEGER PRIMARY KEY,
+                    geometry BLOB NOT NULL,
+                    num_samples INTEGER NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+            """)
+
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS keystroke_profiles (
+                    user_id INTEGER PRIMARY KEY,
+                    profile TEXT NOT NULL,
+                    num_samples INTEGER NOT NULL DEFAULT 0,
+                    vector_length INTEGER NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+            """)
+
             self._ensure_face_encoding_columns()
             self._ensure_user_columns()
             self.conn.commit()
@@ -302,6 +323,174 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Fehler beim Abrufen aller Gesichtskodierungen: {e}")
             raise DatabaseError(f"Gesichtskodierungen konnten nicht abgerufen werden: {e}")
+    
+    # ------------------------------------------------------------------
+    # 3D-Geometrie-Referenzmodell (Anti-Spoofing)
+    # ------------------------------------------------------------------
+
+    def upsert_face_geometry_model(
+        self,
+        user_id: int,
+        geometry_blob: bytes,
+        num_samples: int,
+    ) -> None:
+        """Speichert/aktualisiert das aggregierte 3D-Modell eines Benutzers."""
+        self._ensure_connected()
+        try:
+            self.cursor.execute(
+                """
+                INSERT INTO face_geometry_models (user_id, geometry, num_samples, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    geometry=excluded.geometry,
+                    num_samples=excluded.num_samples,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (user_id, sqlite3.Binary(geometry_blob), int(num_samples)),
+            )
+            self.conn.commit()
+            logger.debug(
+                "3D-Modell für Benutzer %s aktualisiert (%s Samples)", user_id, num_samples
+            )
+        except Exception as e:
+            logger.error(f"Fehler beim Speichern des 3D-Modells: {e}")
+            raise DatabaseError(f"3D-Modell konnte nicht gespeichert werden: {e}")
+
+    def get_face_geometry_model(self, user_id: int) -> Optional[Tuple[bytes, int]]:
+        """Gibt (geometry_blob, num_samples) für einen Benutzer zurück oder None."""
+        self._ensure_connected()
+        try:
+            self.cursor.execute(
+                "SELECT geometry, num_samples FROM face_geometry_models WHERE user_id = ?",
+                (user_id,),
+            )
+            row = self.cursor.fetchone()
+            if not row or row[0] is None:
+                return None
+            return bytes(row[0]), int(row[1])
+        except Exception as e:
+            logger.error(f"Fehler beim Abrufen des 3D-Modells: {e}")
+            return None
+
+    def get_all_face_geometry_models(self) -> List[Tuple[str, bytes, int]]:
+        """Gibt alle 3D-Modelle als (benutzername, geometry_blob, num_samples) zurück."""
+        self._ensure_connected()
+        try:
+            self.cursor.execute(
+                """
+                SELECT u.name, g.geometry, g.num_samples
+                FROM face_geometry_models g
+                JOIN users u ON g.user_id = u.id
+                """
+            )
+            return [(name, bytes(blob), int(n)) for name, blob, n in self.cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Fehler beim Abrufen der 3D-Modelle: {e}")
+            return []
+    
+    # ------------------------------------------------------------------
+    # Tippmuster-Profile (Keystroke Dynamics)
+    # ------------------------------------------------------------------
+
+    def upsert_keystroke_profile(
+        self,
+        user_id: int,
+        profile_json: str,
+        num_samples: int,
+        vector_length: int,
+    ) -> None:
+        """Speichert/aktualisiert das Tippmuster-Profil eines Benutzers."""
+        self._ensure_connected()
+        try:
+            self.cursor.execute(
+                """
+                INSERT INTO keystroke_profiles
+                    (user_id, profile, num_samples, vector_length, updated_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    profile=excluded.profile,
+                    num_samples=excluded.num_samples,
+                    vector_length=excluded.vector_length,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (user_id, profile_json, int(num_samples), int(vector_length)),
+            )
+            self.conn.commit()
+            logger.debug(
+                "Tippmuster-Profil für Benutzer %s gespeichert (%s Proben)",
+                user_id, num_samples,
+            )
+        except Exception as e:
+            logger.error(f"Fehler beim Speichern des Tippmuster-Profils: {e}")
+            raise DatabaseError(f"Tippmuster-Profil konnte nicht gespeichert werden: {e}")
+
+    def get_keystroke_profile(self, user_id: int) -> Optional[str]:
+        """Gibt den JSON-Profiltext eines Benutzers zurück oder None."""
+        self._ensure_connected()
+        try:
+            self.cursor.execute(
+                "SELECT profile FROM keystroke_profiles WHERE user_id = ?",
+                (user_id,),
+            )
+            row = self.cursor.fetchone()
+            return row[0] if row and row[0] else None
+        except Exception as e:
+            logger.error(f"Fehler beim Abrufen des Tippmuster-Profils: {e}")
+            return None
+
+    def get_keystroke_profile_by_name(self, user_name: str) -> Optional[str]:
+        """Gibt den JSON-Profiltext zu einem Benutzernamen zurück oder None."""
+        self._ensure_connected()
+        try:
+            self.cursor.execute(
+                """
+                SELECT k.profile
+                FROM keystroke_profiles k
+                JOIN users u ON k.user_id = u.id
+                WHERE u.name = ?
+                """,
+                (user_name,),
+            )
+            row = self.cursor.fetchone()
+            return row[0] if row and row[0] else None
+        except Exception as e:
+            logger.error(f"Fehler beim Abrufen des Tippmuster-Profils: {e}")
+            return None
+
+    def has_keystroke_profile(self, user_id: int) -> bool:
+        """True, wenn für den Benutzer ein Tippmuster-Profil hinterlegt ist."""
+        return self.get_keystroke_profile(user_id) is not None
+
+    def get_all_keystroke_profiles(self) -> List[tuple]:
+        """Gibt alle Tippmuster-Profile als (user_id, name, profile_json) zurück."""
+        self._ensure_connected()
+        try:
+            self.cursor.execute(
+                """
+                SELECT k.user_id, u.name, k.profile
+                FROM keystroke_profiles k
+                JOIN users u ON k.user_id = u.id
+                """
+            )
+            return [
+                (int(uid), name, profile)
+                for uid, name, profile in self.cursor.fetchall()
+                if profile
+            ]
+        except Exception as e:
+            logger.error(f"Fehler beim Abrufen aller Tippmuster-Profile: {e}")
+            return []
+
+    def delete_keystroke_profile(self, user_id: int) -> None:
+        """Entfernt das Tippmuster-Profil eines Benutzers."""
+        self._ensure_connected()
+        try:
+            self.cursor.execute(
+                "DELETE FROM keystroke_profiles WHERE user_id = ?", (user_id,)
+            )
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Fehler beim Löschen des Tippmuster-Profils: {e}")
     
     def verify_user_pin(self, pin: str) -> bool:
         """Verifiziert eine PIN gegen alle Benutzer"""

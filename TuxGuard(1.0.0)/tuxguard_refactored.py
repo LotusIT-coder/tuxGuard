@@ -23,8 +23,16 @@ from PIL import Image, ImageDraw, ImageTk
 import pystray
 
 from face_mediapipe import (
-    safe_face_encodings_from_file,
+    safe_face_enrollment_from_file,
 )
+from face_liveness import (
+    aggregate_geometries,
+    combine_geometry_models,
+    deserialize_geometry,
+    serialize_geometry,
+)
+import keystroke_dynamics as ksd
+import presence
 
 # Lokale Module
 from config import Config
@@ -38,6 +46,7 @@ from simple_ui import (
     LoginDialog,
     FirstRunWizard,
     MasterPasswordSetupDialog,
+    KeystrokeEnrollmentDialog,
     show_recovery_code,
 )
 from auth import MasterAuth, MasterAuthError
@@ -106,6 +115,15 @@ class TuxGuardApplication:
         self.current_user_is_admin: bool = False
         self.minimize_behavior = Config.MINIMIZE_BEHAVIOR
         self.close_behavior = Config.CLOSE_BEHAVIOR
+
+        # Tippmustererkennung (2. Überwachungsfaktor)
+        self.keystroke_monitor = None
+        self._keystroke_profiles_cache: List[tuple] = []
+        self.last_face_seen_at = 0.0
+        self.last_keystroke_match_at = 0.0
+        self.last_keystroke_intruder_at = 0.0
+        self.keystroke_matched_user: Optional[str] = None
+        self.face_presence_ttl = float(getattr(Config, "FACE_PRESENCE_TTL_SECONDS", 4))
         
         # Threads
         self.active_threads = []
@@ -395,6 +413,8 @@ class TuxGuardApplication:
         self.ui.set_callback('add_admin_password', self._add_additional_admin_password)
         self.ui.set_callback('security_settings_changed', self._on_security_settings_changed)
         self.ui.set_callback('ui_behavior_changed', self._on_ui_behavior_changed)
+        self.ui.set_callback('save_keystroke_settings', self._on_save_keystroke_settings)
+        self.ui.set_callback('train_keystrokes_prompt', self._train_keystrokes_prompt)
         
         # Kamera Callbacks
         self.camera_manager.set_callbacks(
@@ -409,7 +429,8 @@ class TuxGuardApplication:
         self.ui.user_list_widget.set_callbacks(
             show_images=self._show_user_images,
             add_images=self._add_images_to_user,
-            delete_user=self._delete_user
+            delete_user=self._delete_user,
+            train_keystrokes=self._train_keystrokes
         )
         
         # Window Callback
@@ -421,6 +442,7 @@ class TuxGuardApplication:
             self.deadman_action,
         )
         self.ui.set_ui_behavior(self.minimize_behavior, self.close_behavior)
+        self.ui.set_keystroke_settings(self._current_keystroke_settings())
 
     def _setup_ui_logging(self):
         """Lädt vorhandene Logs in die GUI und spiegelt neue Einträge live hinein."""
@@ -574,7 +596,34 @@ class TuxGuardApplication:
         """Überwacht Sperr- und Totmannschalter-Timeouts während der Überwachung."""
         while self.monitoring_active:
             time.sleep(1)
-            absence_seconds = time.time() - self.last_authorized_seen_at
+            now = time.time()
+
+            # Fusion aus Gesichts- und Tippmustererkennung (falls aktiv).
+            fusion_loss_action = None
+            fusion_loss_reason = ""
+            if self._fusion_active():
+                face_present = (now - self.last_face_seen_at) <= self.face_presence_ttl
+                ks_state = self._keystroke_state(now)
+                decision = presence.evaluate_presence(
+                    face_present, ks_state, self._presence_config())
+                if decision.keep_alive:
+                    self.last_authorized_seen_at = now
+                    self.deadman_triggered = False
+                elif decision.immediate_action:
+                    reason = decision.reason or "Präsenzfaktor verloren"
+                    self.root.after(0, lambda a=decision.immediate_action, r=reason:
+                                    self._apply_presence_action(a, r))
+                    continue
+                else:
+                    # Passiver Verlust: konfigurierte Aktion erst nach Karenzzeit.
+                    fusion_loss_action = (
+                        self._presence_config().on_keystroke_lost
+                        if decision.lost_factor == presence.FACTOR_KEYSTROKE
+                        else self._presence_config().on_face_lost
+                    )
+                    fusion_loss_reason = decision.reason or "Präsenzfaktor verloren"
+
+            absence_seconds = now - self.last_authorized_seen_at
 
             if self.security_mode == "deadman":
                 if not self.deadman_triggered and absence_seconds >= self.deadman_timeout_seconds:
@@ -583,9 +632,13 @@ class TuxGuardApplication:
                 continue
 
             if not self.security_lock_active and absence_seconds >= self.security_lock_delay_seconds:
-                self.root.after(0, lambda: self._activate_security_lock(
-                    f"Kein legitimer Nutzer seit {self.security_lock_delay_seconds} Sekunden erkannt"
-                ))
+                if fusion_loss_action is not None:
+                    self.root.after(0, lambda a=fusion_loss_action, r=fusion_loss_reason:
+                                    self._apply_presence_action(a, r))
+                else:
+                    self.root.after(0, lambda: self._activate_security_lock(
+                        f"Kein legitimer Nutzer seit {self.security_lock_delay_seconds} Sekunden erkannt"
+                    ))
 
     def _execute_deadman_action(self):
         """Führt die konfigurierte Totmannschalter-Aktion aus."""
@@ -915,6 +968,401 @@ class TuxGuardApplication:
         finally:
             self.security_lock_unlock_pending = False
     
+    # ------------------------------------------------------------------
+    # Tippmustererkennung (Keystroke Dynamics) – 2. Faktor der Überwachung
+    # ------------------------------------------------------------------
+
+    def _keystroke_config(self) -> "ksd.KeystrokeConfig":
+        """Liefert die aktuelle Keystroke-Konfiguration aus Config."""
+        return ksd.KeystrokeConfig.from_app_config(Config)
+
+    def _presence_config(self) -> "presence.PresenceConfig":
+        """Liefert die aktuelle Fusions-/Reaktionskonfiguration aus Config."""
+        return presence.PresenceConfig.from_app_config(Config)
+
+    def _fusion_active(self) -> bool:
+        """True, wenn das Tippmuster aktiv in die Präsenzbewertung eingeht."""
+        cfg = self._keystroke_config()
+        return (
+            cfg.enabled
+            and self.keystroke_monitor is not None
+            and self.keystroke_monitor.running
+            and bool(self._keystroke_profiles_cache)
+            and self._presence_config().fusion_mode != presence.FUSION_FACE_ONLY
+        )
+
+    def _load_keystroke_profiles(self) -> None:
+        """Lädt alle Tippmuster-Profile in den Cache (nur Hauptthread/DB)."""
+        cache = []
+        try:
+            for _uid, name, blob in self.db_manager.get_all_keystroke_profiles():
+                profile = ksd.deserialize_profile(blob)
+                if profile is not None:
+                    cache.append((name, profile))
+        except Exception as exc:
+            self.logger.error("Tippmuster-Profile konnten nicht geladen werden: %s", exc)
+        self._keystroke_profiles_cache = cache
+
+    def _start_keystroke_monitor(self) -> None:
+        """Startet den systemweiten Tippmuster-Monitor (falls aktiviert)."""
+        cfg = self._keystroke_config()
+        if not cfg.enabled:
+            return
+        self._load_keystroke_profiles()
+        if not self._keystroke_profiles_cache:
+            self.ui.add_security_log(
+                "Tippmuster-Überwachung inaktiv: keine Referenzmuster angelernt", "WARNING")
+            return
+        try:
+            self.keystroke_monitor = ksd.KeystrokeMonitor(
+                cfg, self._on_keystroke_sample, self.logger)
+            if self.keystroke_monitor.start():
+                self.ui.add_security_log("Tippmuster-Überwachung aktiv (2. Faktor)")
+            else:
+                self.ui.add_security_log(
+                    "Tippmuster-Überwachung nicht verfügbar (pynput/Rechte fehlen)", "WARNING")
+        except Exception as exc:
+            self.logger.error("Tippmuster-Monitor-Start fehlgeschlagen: %s", exc)
+            self.keystroke_monitor = None
+
+    def _stop_keystroke_monitor(self) -> None:
+        if self.keystroke_monitor is not None:
+            try:
+                self.keystroke_monitor.stop()
+            except Exception:
+                pass
+            self.keystroke_monitor = None
+
+    def _match_keystroke_sample(self, sample) -> tuple:
+        """Vergleicht eine Live-Probe mit allen Referenzmustern (reine Funktion).
+
+        Bevorzugt das Profil des aktuell per Gesicht erkannten Nutzers; sonst
+        wird der beste Treffer über alle Nutzer gewählt. Rückgabe:
+        (user_name|None, distance).
+        """
+        cfg = self._keystroke_config()
+        cache = list(self._keystroke_profiles_cache)
+        if not cache:
+            return None, float("inf")
+
+        # Vorrang: zuletzt per Gesicht erkannter Nutzer.
+        ordered = cache
+        face_user = self.current_user
+        if face_user:
+            ordered = sorted(cache, key=lambda e: 0 if e[0] == face_user else 1)
+
+        best_user = None
+        best_distance = float("inf")
+        for name, profile in ordered:
+            distance = ksd.match_distance(profile, sample, cfg.std_floor_ms)
+            if distance < best_distance:
+                best_distance = distance
+                best_user = name
+        if best_distance <= cfg.match_threshold:
+            return best_user, best_distance
+        return None, best_distance
+
+    def _on_keystroke_sample(self, sample) -> None:
+        """Callback des Monitors (pynput-Thread): nur In-Memory-Arbeit.
+
+        DB-/UI-Operationen werden auf den Tk-Hauptthread umgeleitet.
+        """
+        try:
+            matched_user, distance = self._match_keystroke_sample(sample)
+            now = time.time()
+            cfg = self._keystroke_config()
+            confidence = ksd.match_confidence(distance, cfg.match_threshold)
+            if matched_user:
+                self.last_keystroke_match_at = now
+                self.keystroke_matched_user = matched_user
+                self.root.after(0, lambda u=matched_user, d=distance, s=sample:
+                                self._handle_keystroke_match(u, d, s))
+            else:
+                intruder_threshold = float(getattr(
+                    Config, "KEYSTROKE_INTRUDER_CONFIDENCE_THRESHOLD", 0.35
+                ))
+                if confidence <= intruder_threshold:
+                    self.last_keystroke_intruder_at = now
+                    self.root.after(0, lambda d=distance, c=confidence:
+                                    self._handle_keystroke_intruder(d, c))
+        except Exception as exc:
+            self.logger.debug("Tippmuster-Auswertung fehlgeschlagen: %s", exc)
+
+    def _handle_keystroke_match(self, user_name, distance, sample) -> None:
+        """Hauptthread: bestätigtes Tippmuster protokollieren + adaptiv lernen."""
+        cfg = self._keystroke_config()
+        confidence = ksd.match_confidence(distance, cfg.match_threshold)
+        self.logger.info(
+            "Tippmuster bestätigt: %s (Distanz=%.2f, Konfidenz=%.0f%%)",
+            user_name, distance, confidence * 100)
+        if cfg.adaptive_learning:
+            self._apply_keystroke_adaptive(user_name, sample)
+
+    def _handle_keystroke_intruder(self, distance, confidence: float) -> None:
+        """Hauptthread: fremdes Tippmuster protokollieren."""
+        self.ui.add_security_log(
+            f"Fremdes Tippmuster erkannt (Distanz {distance:.2f}, Konfidenz {confidence * 100:.0f}%)",
+            "WARNING",
+        )
+        self.logger.warning(
+            "Fremdes Tippmuster erkannt (Distanz=%.2f, Konfidenz=%.0f%%)",
+            distance, confidence * 100,
+        )
+
+    def _apply_keystroke_adaptive(self, user_name, sample) -> None:
+        """Verfeinert das Profil eines Nutzers mit einer bestätigten Probe."""
+        try:
+            user_id = self.db_manager.get_user_id(user_name)
+            if user_id is None:
+                return
+            blob = self.db_manager.get_keystroke_profile(user_id)
+            profile = ksd.deserialize_profile(blob)
+            if profile is None:
+                return
+            cfg = self._keystroke_config()
+            updated = ksd.update_profile(profile, sample, cfg.max_profile_keystrokes)
+            self.db_manager.upsert_keystroke_profile(
+                user_id,
+                ksd.serialize_profile(updated),
+                int(updated.get("n_keystrokes", 0)),
+                0,
+            )
+            # Cache aktualisieren.
+            self._keystroke_profiles_cache = [
+                (name, updated if name == user_name else prof)
+                for name, prof in self._keystroke_profiles_cache
+            ]
+        except Exception as exc:
+            self.logger.debug("Adaptives Tippmuster-Update fehlgeschlagen: %s", exc)
+
+    def _keystroke_state(self, now: float) -> str:
+        """Liefert den aktuellen Tippmuster-Faktorzustand für die Fusion."""
+        cfg = self._keystroke_config()
+        if (now - self.last_keystroke_intruder_at) <= cfg.intruder_ttl_seconds:
+            return presence.KS_INTRUDER
+        if (now - self.last_keystroke_match_at) <= cfg.presence_ttl_seconds:
+            return presence.KS_MATCH
+        return presence.KS_IDLE
+
+    def _apply_presence_action(self, action: str, reason: str) -> None:
+        """Führt die konfigurierte Reaktion auf einen Faktor-Verlust aus."""
+        if action == presence.ACTION_IGNORE:
+            return
+        if action == presence.ACTION_WARN:
+            self.ui.add_security_log(f"Warnung: {reason}", "WARNING")
+            return
+        if action == presence.ACTION_DEADMAN:
+            if not self.deadman_triggered:
+                self.deadman_triggered = True
+                self._execute_deadman_action()
+            return
+        # ACTION_LOCK (Standard)
+        if not self.security_lock_active:
+            self._activate_security_lock(reason)
+
+    def _enroll_keystrokes(self, user_id: int, user_name: str) -> bool:
+        """Bietet direkt nach der Benutzeranlage das Tippmuster-Training an."""
+        cfg = self._keystroke_config()
+        if not cfg.enabled:
+            return False
+        if not messagebox.askyesno(
+            "Tippmuster trainieren",
+            "Möchten Sie jetzt das Tippmuster als zweiten Überwachungsfaktor anlernen?\n"
+            "Dazu tippen Sie kurz natürlichen Text.",
+        ):
+            return False
+        return self._run_keystroke_enrollment(user_id, user_name)
+
+    def _train_keystrokes(self, user_name: str) -> None:
+        """Kontextmenü-Aktion: Tippmuster eines bestehenden Nutzers anlernen."""
+        user_id = self.db_manager.get_user_id(user_name)
+        if user_id is None:
+            messagebox.showerror("Fehler", f"Benutzer '{user_name}' nicht gefunden.")
+            return
+        self._run_keystroke_enrollment(user_id, user_name)
+
+    def _run_keystroke_enrollment(self, user_id: int, user_name: str) -> bool:
+        """Sammelt Freitext-Anschläge und speichert das Referenzprofil."""
+        cfg = self._keystroke_config()
+        try:
+            dialog = KeystrokeEnrollmentDialog(
+                self.root, user_name, cfg.min_enrollment_keystrokes,
+                max_dwell_ms=cfg.max_dwell_ms, max_flight_ms=cfg.max_flight_ms)
+            samples = dialog.show()
+            if not samples:
+                self.ui.add_security_log(
+                    f"Tippmuster-Training für {user_name} abgebrochen", "WARNING")
+                return False
+            profile = ksd.build_profile(samples)
+            if profile is None:
+                messagebox.showerror("Fehler", "Zu wenige Anschläge für ein Profil.")
+                return False
+            self.db_manager.upsert_keystroke_profile(
+                user_id,
+                ksd.serialize_profile(profile),
+                int(profile.get("n_keystrokes", 0)),
+                0,
+            )
+            self._load_keystroke_profiles()
+            self.ui.add_security_log(
+                f"Tippmuster für {user_name} gespeichert "
+                f"({int(profile.get('n_keystrokes', 0))} Anschläge)", "SUCCESS")
+            return True
+        except Exception as exc:
+            self.logger.error("Tippmuster-Training fehlgeschlagen: %s", exc)
+            messagebox.showerror("Fehler", f"Tippmuster konnte nicht gespeichert werden:\n{exc}")
+            return False
+
+    def _current_keystroke_settings(self) -> dict:
+        """Liefert die aktuelle Tippmuster-/Fusionskonfiguration für die UI."""
+        kcfg = self._keystroke_config()
+        pcfg = self._presence_config()
+        return {
+            "enabled": kcfg.enabled,
+            "global_capture": kcfg.global_capture,
+            "adaptive_learning": kcfg.adaptive_learning,
+            "match_threshold": kcfg.match_threshold,
+            "intruder_confidence_threshold": float(
+                getattr(Config, "KEYSTROKE_INTRUDER_CONFIDENCE_THRESHOLD", 0.35)
+            ),
+            "min_enrollment_keystrokes": kcfg.min_enrollment_keystrokes,
+            "fusion_mode": pcfg.fusion_mode,
+            "primary_factor": pcfg.primary_factor,
+            "on_face_lost": pcfg.on_face_lost,
+            "on_keystroke_intruder": pcfg.on_keystroke_intruder,
+            "on_keystroke_lost": pcfg.on_keystroke_lost,
+        }
+
+    def _on_save_keystroke_settings(self) -> None:
+        """Speichert die in der UI vorgenommenen Tippmuster-/Fusionsoptionen."""
+        if not self.ui:
+            return
+        settings = self.ui.collect_keystroke_settings()
+        if not self._require_admin_password(
+            "Änderungen an der Tippmustererkennung erfordern das Admin-Passwort."
+        ):
+            if self.ui:
+                self.ui.set_keystroke_settings(self._current_keystroke_settings())
+            return
+
+        valid_actions = {"lock", "warn", "deadman", "ignore"}
+        valid_fusion = {"face_only", "keystroke_only", "any", "all", "priority"}
+
+        try:
+            threshold = min(5.0, max(0.5, float(settings.get("match_threshold"))))
+        except (TypeError, ValueError):
+            threshold = Config.KEYSTROKE_MATCH_THRESHOLD
+        try:
+            intruder_confidence = min(
+                1.0,
+                max(0.0, float(settings.get("intruder_confidence_threshold"))),
+            )
+        except (TypeError, ValueError):
+            intruder_confidence = float(
+                getattr(Config, "KEYSTROKE_INTRUDER_CONFIDENCE_THRESHOLD", 0.35)
+            )
+        try:
+            enrollment = min(2000, max(50, int(settings.get("min_enrollment_keystrokes"))))
+        except (TypeError, ValueError):
+            enrollment = Config.KEYSTROKE_MIN_ENROLLMENT_KEYSTROKES
+
+        fusion = settings.get("fusion_mode")
+        if fusion not in valid_fusion:
+            fusion = Config.PRESENCE_FUSION_MODE
+        primary = settings.get("primary_factor")
+        if primary not in {"face", "keystroke"}:
+            primary = Config.PRESENCE_PRIMARY_FACTOR
+        on_face_lost = settings.get("on_face_lost")
+        if on_face_lost not in valid_actions:
+            on_face_lost = Config.PRESENCE_ON_FACE_LOST
+        on_intruder = settings.get("on_keystroke_intruder")
+        if on_intruder not in valid_actions:
+            on_intruder = Config.PRESENCE_ON_KEYSTROKE_INTRUDER
+        on_ks_lost = settings.get("on_keystroke_lost")
+        if on_ks_lost not in valid_actions:
+            on_ks_lost = Config.PRESENCE_ON_KEYSTROKE_LOST
+
+        Config.KEYSTROKE_DYNAMICS_ENABLED = bool(settings.get("enabled", True))
+        Config.KEYSTROKE_GLOBAL_CAPTURE = bool(settings.get("global_capture", True))
+        Config.KEYSTROKE_ADAPTIVE_LEARNING = bool(settings.get("adaptive_learning", True))
+        Config.KEYSTROKE_MATCH_THRESHOLD = threshold
+        Config.KEYSTROKE_INTRUDER_CONFIDENCE_THRESHOLD = intruder_confidence
+        Config.KEYSTROKE_MIN_ENROLLMENT_KEYSTROKES = enrollment
+        Config.PRESENCE_FUSION_MODE = fusion
+        Config.PRESENCE_PRIMARY_FACTOR = primary
+        Config.PRESENCE_ON_FACE_LOST = on_face_lost
+        Config.PRESENCE_ON_KEYSTROKE_INTRUDER = on_intruder
+        Config.PRESENCE_ON_KEYSTROKE_LOST = on_ks_lost
+
+        self.logger.info(
+            "Tippmuster-Konfiguration aktualisiert: aktiv=%s fusion=%s primär=%s schwelle=%.2f alarm_conf=%.2f",
+            Config.KEYSTROKE_DYNAMICS_ENABLED, fusion, primary, threshold, intruder_confidence,
+        )
+        self.ui.add_security_log("Tippmuster-Konfiguration aktualisiert")
+
+        # Normalisierte Werte in die UI zurückspiegeln.
+        self.ui.set_keystroke_settings(self._current_keystroke_settings())
+
+        # Bei laufender Überwachung Monitor neu starten, damit Änderungen greifen.
+        if self.monitoring_active:
+            self._stop_keystroke_monitor()
+            self._start_keystroke_monitor()
+
+    def _train_keystrokes_prompt(self) -> None:
+        """Öffnet eine Nutzerauswahl und startet danach das Tippmuster-Training."""
+        users = self.db_manager.get_all_users()
+        if not users:
+            messagebox.showinfo(
+                "Keine Benutzer",
+                "Es sind keine Benutzer vorhanden. Bitte zuerst einen Benutzer anlegen.",
+            )
+            return
+        names = [name for _, name in users]
+        selected = self._prompt_user_selection(
+            "Tippmuster trainieren",
+            "Für welchen Benutzer soll das Tippmuster angelernt werden?",
+            names,
+        )
+        if selected:
+            self._train_keystrokes(selected)
+
+    def _prompt_user_selection(self, title: str, prompt: str, names: list):
+        """Kleiner modaler Auswahldialog für einen Benutzernamen."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        result = {"value": None}
+
+        tk.Label(dialog, text=prompt, font=("Arial", 11)).pack(padx=20, pady=(16, 8))
+        var = tk.StringVar(value=names[0])
+        box = ttk.Combobox(dialog, textvariable=var, state="readonly", values=names, width=30)
+        box.pack(padx=20, pady=6)
+
+        btns = tk.Frame(dialog)
+        btns.pack(pady=(10, 16))
+
+        def _ok():
+            result["value"] = var.get()
+            dialog.destroy()
+
+        def _cancel():
+            dialog.destroy()
+
+        tk.Button(btns, text="Trainieren", command=_ok, padx=14, pady=5).pack(side=tk.LEFT, padx=6)
+        tk.Button(btns, text="Abbrechen", command=_cancel, padx=14, pady=5).pack(side=tk.LEFT, padx=6)
+
+        dialog.protocol("WM_DELETE_WINDOW", _cancel)
+        dialog.update_idletasks()
+        w = dialog.winfo_width()
+        h = dialog.winfo_height()
+        x = (dialog.winfo_screenwidth() // 2) - (w // 2)
+        y = (dialog.winfo_screenheight() // 2) - (h // 2)
+        dialog.geometry(f"+{x}+{y}")
+        self.root.wait_window(dialog)
+        return result["value"]
+
     def _refresh_user_list(self):
         """Aktualisiert die Benutzerliste"""
         try:
@@ -974,6 +1422,8 @@ class TuxGuardApplication:
                                   f"Benutzer '{name}' mit {saved_count} Gesichtsbild(ern) erstellt!")
                 self._refresh_user_list()
                 self.logger.info(f"Benutzer '{name}' mit {saved_count} Bildern erstellt")
+                # Optionales Tippmuster-Training direkt nach der Anlage anbieten.
+                self._enroll_keystrokes(user_id, name)
             else:
                 # Benutzer löschen falls keine Bilder gespeichert
                 self.db_manager.delete_user(name)
@@ -1063,10 +1513,13 @@ class TuxGuardApplication:
     def _store_face_images_for_user(self, user_id: int, user_name: str, file_specs) -> int:
         """Speichert mehrere Gesichtsbilder für einen Benutzer."""
         saved_count = 0
+        new_geometries: List[np.ndarray] = []
 
         for file_path, _ in file_specs:
             try:
-                face_encodings = safe_face_encodings_from_file(file_path)
+                enrollment = safe_face_enrollment_from_file(file_path)
+                face_encodings = enrollment.get("encodings", [])
+                geometries = enrollment.get("geometry", [])
 
                 if not face_encodings:
                     messagebox.showwarning(
@@ -1094,6 +1547,9 @@ class TuxGuardApplication:
                     image_data=image_data,
                     source_filename=os.path.basename(file_path),
                 )
+                # 3D-Geometrie des größten Gesichts für das Referenzmodell sammeln.
+                if geometries:
+                    new_geometries.append(geometries[0])
                 saved_count += 1
                 self.logger.info(
                     "Bild für Benutzer '%s' gespeichert: %s",
@@ -1108,7 +1564,54 @@ class TuxGuardApplication:
                     f"Fehler beim Verarbeiten von {os.path.basename(file_path)}: {e}"
                 )
 
+        if new_geometries:
+            self._update_face_geometry_model(user_id, user_name, new_geometries)
+
         return saved_count
+
+    def _update_face_geometry_model(
+        self,
+        user_id: int,
+        user_name: str,
+        new_geometries: List[np.ndarray],
+    ) -> None:
+        """Aktualisiert das aggregierte 3D-Referenzmodell des Benutzers.
+
+        Aus den neu hochgeladenen Geometrien wird ein Aggregat gebildet und
+        gewichtet mit einem evtl. bestehenden Modell verschmolzen. Dieses
+        Modell dient der Kamera als Konsistenz-Check gegen 2D-Foto-Angriffe.
+        """
+        try:
+            new_model = aggregate_geometries(new_geometries)
+            if new_model is None:
+                self.logger.warning(
+                    "Keine gültige 3D-Geometrie für Benutzer '%s' – Modell unverändert.",
+                    user_name,
+                )
+                return
+
+            existing = self.db_manager.get_face_geometry_model(user_id)
+            existing_model = deserialize_geometry(existing[0]) if existing else None
+            existing_n = existing[1] if existing else 0
+
+            combined, total = combine_geometry_models(
+                existing_model, existing_n, new_model, len(new_geometries)
+            )
+            if combined is None:
+                return
+
+            self.db_manager.upsert_face_geometry_model(
+                user_id, serialize_geometry(combined), total
+            )
+            self.logger.info(
+                "3D-Referenzmodell für Benutzer '%s' aktualisiert (%s Stichproben).",
+                user_name,
+                total,
+            )
+        except Exception as e:
+            self.logger.error(
+                "Fehler beim Aktualisieren des 3D-Modells für '%s': %s", user_name, e
+            )
 
     def _add_images_to_user(self, user_name: str):
         """Fügt einem bestehenden Benutzer weitere Trainingsbilder hinzu."""
@@ -1292,7 +1795,11 @@ class TuxGuardApplication:
         aufgehoben, sobald ein legitimer Nutzer erkannt wird.
         """
         now = time.time()
-        self.last_authorized_seen_at = now
+        self.last_face_seen_at = now
+        # Bei aktiver Fusion entscheidet der Deadman-Loop über den Sperr-Timer;
+        # andernfalls reicht der reine Gesichts-Heartbeat.
+        if not self._fusion_active():
+            self.last_authorized_seen_at = now
         if self.deadman_triggered:
             self.deadman_triggered = False
         if (
@@ -1325,7 +1832,9 @@ class TuxGuardApplication:
           aufgehoben; der Dialog wird hier ausgelöst.
         - ``deadman``: keine Aufhebung über die Erkennung.
         """
-        self.last_authorized_seen_at = time.time()
+        self.last_face_seen_at = time.time()
+        if not self._fusion_active():
+            self.last_authorized_seen_at = time.time()
         self.deadman_triggered = False
         self.ui.add_security_log(f"Benutzer erkannt: {user_name}")
         self.logger.info(f"Autorisierter Zugriff: {user_name}")
@@ -1400,6 +1909,7 @@ class TuxGuardApplication:
 
             self.monitoring_active = True
             self.last_authorized_seen_at = time.time()
+            self.last_face_seen_at = time.time()
             self.deadman_triggered = False
             self.ui.clear_monitor_preview("Kamera wird gestartet...")
             
@@ -1409,6 +1919,9 @@ class TuxGuardApplication:
                     self.ui.add_security_log("Kamera-Überwachung gestartet")
                 else:
                     self.ui.add_security_log("Kamera-Start fehlgeschlagen")
+
+            # Tippmuster-Überwachung als zweiten Faktor starten.
+            self._start_keystroke_monitor()
 
             if self.deadman_thread is None or not self.deadman_thread.is_alive():
                 self.deadman_thread = threading.Thread(
@@ -1435,6 +1948,9 @@ class TuxGuardApplication:
             
             # Kamera stoppen
             self.camera_manager.stop()
+
+            # Tippmuster-Überwachung stoppen.
+            self._stop_keystroke_monitor()
             
             if self.security_lock_active:
                 self._release_security_lock()

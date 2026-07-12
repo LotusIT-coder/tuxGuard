@@ -195,6 +195,7 @@ class SimpleUserListWidget:
         self.show_images_callback: Optional[Callable] = None
         self.add_images_callback: Optional[Callable] = None
         self.delete_user_callback: Optional[Callable] = None
+        self.train_keystrokes_callback: Optional[Callable] = None
         self._create_widgets()
     
     def _create_widgets(self):
@@ -217,6 +218,7 @@ class SimpleUserListWidget:
         self.images_menu.add_command(label="Bilder hinzufügen", command=self._add_images)
 
         self.context_menu.add_cascade(label="Bilder verwalten", menu=self.images_menu)
+        self.context_menu.add_command(label="Tippmuster trainieren", command=self._train_keystrokes)
         self.context_menu.add_command(label="Benutzer löschen", command=self._delete_user)
         
         self.listbox.bind("<Button-3>", self._show_context_menu)
@@ -246,6 +248,11 @@ class SimpleUserListWidget:
         if user_name and self.delete_user_callback:
             self.delete_user_callback(user_name)
 
+    def _train_keystrokes(self):
+        user_name = self._selected_user_name()
+        if user_name and self.train_keystrokes_callback:
+            self.train_keystrokes_callback(user_name)
+
     def _selected_user_name(self) -> Optional[str]:
         if not self.listbox:
             return None
@@ -265,13 +272,16 @@ class SimpleUserListWidget:
         for user in users:
             self.listbox.insert(tk.END, f"👤 {user}")
     
-    def set_callbacks(self, show_images=None, add_images=None, delete_user=None):
+    def set_callbacks(self, show_images=None, add_images=None, delete_user=None,
+                      train_keystrokes=None):
         if show_images:
             self.show_images_callback = show_images
         if add_images:
             self.add_images_callback = add_images
         if delete_user:
             self.delete_user_callback = delete_user
+        if train_keystrokes:
+            self.train_keystrokes_callback = train_keystrokes
 
 class SimpleLogWidget:
     """Vereinfachtes Log-Widget"""
@@ -365,6 +375,22 @@ class SimpleMainUI:
         self.deadman_action_row: Optional[Frame] = None
         self.minimize_behavior_var: Optional[tk.StringVar] = None
         self.close_behavior_var: Optional[tk.StringVar] = None
+        # Tippmustererkennung (Konfiguration)
+        self.keystroke_enabled_var: Optional[tk.BooleanVar] = None
+        self.keystroke_global_var: Optional[tk.BooleanVar] = None
+        self.keystroke_adaptive_var: Optional[tk.BooleanVar] = None
+        self.keystroke_fusion_var: Optional[tk.StringVar] = None
+        self.keystroke_primary_var: Optional[tk.StringVar] = None
+        self.keystroke_on_face_lost_var: Optional[tk.StringVar] = None
+        self.keystroke_on_intruder_var: Optional[tk.StringVar] = None
+        self.keystroke_on_ks_lost_var: Optional[tk.StringVar] = None
+        self.keystroke_threshold_var: Optional[tk.StringVar] = None
+        self.keystroke_intruder_confidence_var: Optional[tk.StringVar] = None
+        self.keystroke_enrollment_var: Optional[tk.StringVar] = None
+        self.keystroke_primary_row: Optional[Frame] = None
+        self.keystroke_save_button: Optional[Button] = None
+        self.keystroke_dirty_label: Optional[Label] = None
+        self._keystroke_settings_dirty = False
         self.monitor_preview_label: Optional[Label] = None
         self.monitor_preview_image = None
         self.monitor_preview_status_label: Optional[Label] = None
@@ -481,6 +507,7 @@ class SimpleMainUI:
 
         self._create_monitor_preview_section(frame)
         self._create_security_settings_section(frame)
+        self._create_keystroke_settings_section(frame)
 
         # Log-Widget
         self.security_log_widget = SimpleLogWidget(frame, "🔐 Sicherheitsereignisse")
@@ -508,6 +535,32 @@ class SimpleMainUI:
         if self.close_behavior_var is not None:
             self.close_behavior_var.set(close_behavior)
     
+    def set_keystroke_settings(self, settings: dict):
+        """Übernimmt die aktuelle Tippmuster-/Fusionskonfiguration in die UI."""
+        if not settings:
+            return
+        mapping = [
+            (self.keystroke_enabled_var, "enabled"),
+            (self.keystroke_global_var, "global_capture"),
+            (self.keystroke_adaptive_var, "adaptive_learning"),
+            (self.keystroke_fusion_var, "fusion_mode"),
+            (self.keystroke_primary_var, "primary_factor"),
+            (self.keystroke_on_face_lost_var, "on_face_lost"),
+            (self.keystroke_on_intruder_var, "on_keystroke_intruder"),
+            (self.keystroke_on_ks_lost_var, "on_keystroke_lost"),
+        ]
+        for var, key in mapping:
+            if var is not None and key in settings:
+                var.set(settings[key])
+        if self.keystroke_threshold_var is not None and "match_threshold" in settings:
+            self.keystroke_threshold_var.set(f"{float(settings['match_threshold']):.1f}")
+        if self.keystroke_intruder_confidence_var is not None and "intruder_confidence_threshold" in settings:
+            self.keystroke_intruder_confidence_var.set(f"{float(settings['intruder_confidence_threshold']):.2f}")
+        if self.keystroke_enrollment_var is not None and "min_enrollment_keystrokes" in settings:
+            self.keystroke_enrollment_var.set(str(int(settings["min_enrollment_keystrokes"])))
+        self._update_keystroke_settings_visibility()
+        self._set_keystroke_settings_dirty(False)
+
     def _create_control_section(self, parent, title, buttons):
         container = Frame(parent, bg=ModernColors.SURFACE, relief=tk.RIDGE, bd=2)
         container.pack(fill=tk.X, padx=10, pady=5)
@@ -637,6 +690,267 @@ class SimpleMainUI:
         ).pack(anchor="w", padx=10, pady=(8, 10))
 
         self._update_security_settings_visibility()
+
+    def _create_keystroke_settings_section(self, parent):
+        container = Frame(parent, bg=ModernColors.SURFACE, relief=tk.RIDGE, bd=2)
+        container.pack(fill=tk.X, padx=10, pady=5)
+
+        Label(
+            container,
+            text="⌨️ Tippmustererkennung (2. Faktor)",
+            font=("Arial", 10, "bold"),
+            bg=ModernColors.SURFACE,
+            fg=ModernColors.TEXT_PRIMARY,
+        ).pack(anchor="w", padx=10, pady=(8, 4))
+
+        Label(
+            container,
+            text=("Erkennt anhand des Tipprhythmus, ob der legitime Nutzer aktiv ist – "
+                  "zusätzlich zur Gesichtserkennung. Es werden nur Zeitabstände gemessen, "
+                  "niemals der Inhalt."),
+            font=("Arial", 8),
+            bg=ModernColors.SURFACE,
+            fg=ModernColors.TEXT_SECONDARY,
+            justify="left",
+            wraplength=520,
+        ).pack(anchor="w", padx=10, pady=(0, 6))
+
+        self.keystroke_enabled_var = tk.BooleanVar(value=True)
+        self.keystroke_global_var = tk.BooleanVar(value=True)
+        self.keystroke_adaptive_var = tk.BooleanVar(value=True)
+        self.keystroke_fusion_var = tk.StringVar(value="priority")
+        self.keystroke_primary_var = tk.StringVar(value="face")
+        self.keystroke_on_face_lost_var = tk.StringVar(value="lock")
+        self.keystroke_on_intruder_var = tk.StringVar(value="lock")
+        self.keystroke_on_ks_lost_var = tk.StringVar(value="ignore")
+        self.keystroke_threshold_var = tk.StringVar(value="1.8")
+        self.keystroke_intruder_confidence_var = tk.StringVar(value="0.35")
+        self.keystroke_enrollment_var = tk.StringVar(value="200")
+
+        tk.Checkbutton(
+            container,
+            text="Tippmustererkennung aktivieren",
+            variable=self.keystroke_enabled_var,
+            command=self._on_keystroke_settings_edited,
+            bg=ModernColors.SURFACE, fg=ModernColors.TEXT_PRIMARY,
+            selectcolor=ModernColors.SECONDARY_LIGHT, font=("Arial", 10),
+        ).pack(anchor="w", padx=10, pady=2)
+
+        tk.Checkbutton(
+            container,
+            text="Systemweite Erfassung (erfordert pynput)",
+            variable=self.keystroke_global_var,
+            command=self._on_keystroke_settings_edited,
+            bg=ModernColors.SURFACE, fg=ModernColors.TEXT_PRIMARY,
+            selectcolor=ModernColors.SECONDARY_LIGHT, font=("Arial", 10),
+        ).pack(anchor="w", padx=10, pady=2)
+
+        tk.Checkbutton(
+            container,
+            text="Adaptives Nachlernen bestätigter Muster",
+            variable=self.keystroke_adaptive_var,
+            command=self._on_keystroke_settings_edited,
+            bg=ModernColors.SURFACE, fg=ModernColors.TEXT_PRIMARY,
+            selectcolor=ModernColors.SECONDARY_LIGHT, font=("Arial", 10),
+        ).pack(anchor="w", padx=10, pady=2)
+
+        # Fusionsstrategie
+        fusion_row = Frame(container, bg=ModernColors.SURFACE)
+        fusion_row.pack(fill=tk.X, padx=10, pady=(6, 4))
+        Label(fusion_row, text="Priorität/Fusion:", bg=ModernColors.SURFACE, width=20, anchor="w").pack(side=tk.LEFT)
+        fusion_box = ttk.Combobox(
+            fusion_row, textvariable=self.keystroke_fusion_var, state="readonly",
+            values=["face_only", "keystroke_only", "any", "all", "priority"], width=16,
+        )
+        fusion_box.pack(side=tk.LEFT, padx=10)
+        fusion_box.bind("<<ComboboxSelected>>", lambda _e: self._on_keystroke_fusion_changed())
+
+        # Primärfaktor (nur bei "priority" relevant)
+        primary_row = Frame(container, bg=ModernColors.SURFACE)
+        primary_row.pack(fill=tk.X, padx=10, pady=4)
+        self.keystroke_primary_row = primary_row
+        Label(primary_row, text="Primärfaktor:", bg=ModernColors.SURFACE, width=20, anchor="w").pack(side=tk.LEFT)
+        primary_box = ttk.Combobox(
+            primary_row, textvariable=self.keystroke_primary_var, state="readonly",
+            values=["face", "keystroke"], width=16,
+        )
+        primary_box.pack(side=tk.LEFT, padx=10)
+        primary_box.bind("<<ComboboxSelected>>", lambda _e: self._on_keystroke_settings_edited())
+
+        # Reaktionen bei Verlust/Eindringling
+        face_lost_row = Frame(container, bg=ModernColors.SURFACE)
+        face_lost_row.pack(fill=tk.X, padx=10, pady=4)
+        Label(face_lost_row, text="Bei Gesichtsverlust:", bg=ModernColors.SURFACE, width=20, anchor="w").pack(side=tk.LEFT)
+        face_lost_box = ttk.Combobox(
+            face_lost_row, textvariable=self.keystroke_on_face_lost_var, state="readonly",
+            values=["lock", "warn", "deadman", "ignore"], width=16,
+        )
+        face_lost_box.pack(side=tk.LEFT, padx=10)
+        face_lost_box.bind("<<ComboboxSelected>>", lambda _e: self._on_keystroke_settings_edited())
+
+        intruder_row = Frame(container, bg=ModernColors.SURFACE)
+        intruder_row.pack(fill=tk.X, padx=10, pady=4)
+        Label(intruder_row, text="Bei fremdem Tippmuster:", bg=ModernColors.SURFACE, width=20, anchor="w").pack(side=tk.LEFT)
+        intruder_box = ttk.Combobox(
+            intruder_row, textvariable=self.keystroke_on_intruder_var, state="readonly",
+            values=["lock", "warn", "deadman", "ignore"], width=16,
+        )
+        intruder_box.pack(side=tk.LEFT, padx=10)
+        intruder_box.bind("<<ComboboxSelected>>", lambda _e: self._on_keystroke_settings_edited())
+
+        ks_lost_row = Frame(container, bg=ModernColors.SURFACE)
+        ks_lost_row.pack(fill=tk.X, padx=10, pady=4)
+        Label(ks_lost_row, text="Bei fehlendem Tippmuster:", bg=ModernColors.SURFACE, width=20, anchor="w").pack(side=tk.LEFT)
+        ks_lost_box = ttk.Combobox(
+            ks_lost_row, textvariable=self.keystroke_on_ks_lost_var, state="readonly",
+            values=["lock", "warn", "deadman", "ignore"], width=16,
+        )
+        ks_lost_box.pack(side=tk.LEFT, padx=10)
+        ks_lost_box.bind("<<ComboboxSelected>>", lambda _e: self._on_keystroke_settings_edited())
+
+        # Empfindlichkeit (Schwellwert)
+        threshold_row = Frame(container, bg=ModernColors.SURFACE)
+        threshold_row.pack(fill=tk.X, padx=10, pady=4)
+        Label(threshold_row, text="Empfindlichkeit (Schwelle):", bg=ModernColors.SURFACE, width=20, anchor="w").pack(side=tk.LEFT)
+        threshold_spin = tk.Spinbox(
+            threshold_row, from_=0.5, to=5.0, increment=0.1,
+            textvariable=self.keystroke_threshold_var, width=8,
+            command=self._on_keystroke_settings_edited,
+        )
+        threshold_spin.pack(side=tk.LEFT, padx=10)
+        threshold_spin.bind("<FocusOut>", lambda _e: self._on_keystroke_settings_edited())
+        Label(threshold_row, text="(kleiner = strenger)", bg=ModernColors.SURFACE,
+              fg=ModernColors.TEXT_SECONDARY, font=("Arial", 8)).pack(side=tk.LEFT)
+
+        # Alarm-Konfidenz für fremde Tippmuster
+        intruder_conf_row = Frame(container, bg=ModernColors.SURFACE)
+        intruder_conf_row.pack(fill=tk.X, padx=10, pady=4)
+        Label(
+            intruder_conf_row,
+            text="Alarm-Konfidenz:",
+            bg=ModernColors.SURFACE,
+            width=20,
+            anchor="w",
+        ).pack(side=tk.LEFT)
+        intruder_conf_spin = tk.Spinbox(
+            intruder_conf_row,
+            from_=0.0,
+            to=1.0,
+            increment=0.05,
+            textvariable=self.keystroke_intruder_confidence_var,
+            width=8,
+            command=self._on_keystroke_settings_edited,
+        )
+        intruder_conf_spin.pack(side=tk.LEFT, padx=10)
+        intruder_conf_spin.bind("<FocusOut>", lambda _e: self._on_keystroke_settings_edited())
+        Label(
+            intruder_conf_row,
+            text="(kleiner = schnellerer Alarm)",
+            bg=ModernColors.SURFACE,
+            fg=ModernColors.TEXT_SECONDARY,
+            font=("Arial", 8),
+        ).pack(side=tk.LEFT)
+
+        # Anschläge fürs Anlernen
+        enroll_row = Frame(container, bg=ModernColors.SURFACE)
+        enroll_row.pack(fill=tk.X, padx=10, pady=4)
+        Label(enroll_row, text="Anschläge zum Anlernen:", bg=ModernColors.SURFACE, width=20, anchor="w").pack(side=tk.LEFT)
+        enroll_spin = tk.Spinbox(
+            enroll_row, from_=50, to=2000, increment=10,
+            textvariable=self.keystroke_enrollment_var, width=8,
+            command=self._on_keystroke_settings_edited,
+        )
+        enroll_spin.pack(side=tk.LEFT, padx=10)
+        enroll_spin.bind("<FocusOut>", lambda _e: self._on_keystroke_settings_edited())
+
+        save_row = Frame(container, bg=ModernColors.SURFACE)
+        save_row.pack(fill=tk.X, padx=10, pady=(4, 10))
+        self.keystroke_save_button = Button(
+            save_row,
+            text="💾 Tippmuster-Einstellungen speichern",
+            command=lambda: self._call_callback('save_keystroke_settings'),
+            bg=ModernColors.SECONDARY,
+            fg=ModernColors.TEXT_ON_PRIMARY,
+            font=("Arial", 9, "bold"),
+            padx=12,
+            pady=5,
+            bd=0,
+        )
+        self.keystroke_save_button.pack(anchor="w")
+
+        self.keystroke_dirty_label = Label(
+            save_row,
+            text="",
+            bg=ModernColors.SURFACE,
+            fg=ModernColors.WARNING,
+            font=("Arial", 8, "bold"),
+        )
+        self.keystroke_dirty_label.pack(anchor="w", pady=(4, 0))
+
+        # Training
+        Button(
+            container,
+            text="⌨️ Tippmuster eines Benutzers trainieren…",
+            command=lambda: self._call_callback('train_keystrokes_prompt'),
+            bg=ModernColors.PRIMARY, fg=ModernColors.TEXT_ON_PRIMARY,
+            font=("Arial", 9, "bold"), padx=12, pady=5, bd=0,
+        ).pack(anchor="w", padx=10, pady=(8, 10))
+
+        self._update_keystroke_settings_visibility()
+
+    def _on_keystroke_fusion_changed(self):
+        self._update_keystroke_settings_visibility()
+        self._on_keystroke_settings_edited()
+
+    def _on_keystroke_settings_edited(self):
+        """Markiert die Tippmuster-Einstellungen als bearbeitet, ohne zu speichern."""
+        self._set_keystroke_settings_dirty(True)
+
+    def _set_keystroke_settings_dirty(self, dirty: bool):
+        self._keystroke_settings_dirty = bool(dirty)
+        if self.keystroke_save_button is not None:
+            self.keystroke_save_button.config(
+                text="💾 Änderungen speichern" if dirty else "💾 Tippmuster-Einstellungen speichern"
+            )
+        if self.keystroke_dirty_label is not None:
+            self.keystroke_dirty_label.config(
+                text="Nicht gespeicherte Änderungen" if dirty else ""
+            )
+
+    def _update_keystroke_settings_visibility(self):
+        is_priority = (
+            self.keystroke_fusion_var is not None
+            and self.keystroke_fusion_var.get() == "priority"
+        )
+        if self.keystroke_primary_row is not None:
+            if is_priority:
+                self.keystroke_primary_row.pack(fill=tk.X, padx=10, pady=4)
+            else:
+                self.keystroke_primary_row.pack_forget()
+
+    def _emit_keystroke_settings(self):
+        """Kompatibilitäts-Helfer für alte Aufrufer.
+
+        Die UI speichert nicht mehr automatisch. Diese Methode markiert nur
+        den Entwurfszustand und löst keinen Persistenz-Callback aus.
+        """
+        self._on_keystroke_settings_edited()
+
+    def collect_keystroke_settings(self) -> dict:
+        """Sammelt die aktuellen Keystroke-Eingaben aus der UI."""
+        return {
+            "enabled": bool(self.keystroke_enabled_var.get()),
+            "global_capture": bool(self.keystroke_global_var.get()),
+            "adaptive_learning": bool(self.keystroke_adaptive_var.get()),
+            "fusion_mode": self.keystroke_fusion_var.get(),
+            "primary_factor": self.keystroke_primary_var.get(),
+            "on_face_lost": self.keystroke_on_face_lost_var.get(),
+            "on_keystroke_intruder": self.keystroke_on_intruder_var.get(),
+            "on_keystroke_lost": self.keystroke_on_ks_lost_var.get(),
+            "match_threshold": self.keystroke_threshold_var.get(),
+            "intruder_confidence_threshold": self.keystroke_intruder_confidence_var.get(),
+            "min_enrollment_keystrokes": self.keystroke_enrollment_var.get(),
+        }
 
     def _create_monitor_preview_section(self, parent):
         container = Frame(parent, bg=ModernColors.SURFACE, relief=tk.RIDGE, bd=2)
@@ -825,6 +1139,175 @@ class SimpleMainUI:
         for key in ['test_camera', 'diagnose_camera']:
             if key in self.control_buttons:
                 self.control_buttons[key].config(state=state)
+
+
+class KeystrokeEnrollmentDialog:
+    """Dialog zum Anlernen des Tippmusters über frei getippten Text.
+
+    Der Nutzer tippt natürlichen Text, bis genügend Anschläge für ein stabiles
+    Referenzprofil gesammelt wurden. Es werden ausschließlich Zeitabstände
+    erfasst – niemals der getippte Inhalt.
+    """
+
+    _PRACTICE_TEXT = (
+        "Der schnelle braune Fuchs springt über den faulen Hund. "
+        "Tippen Sie diesen oder einen beliebigen eigenen Text in Ihrem "
+        "gewohnten Rhythmus weiter, bis der Fortschritt vollständig ist."
+    )
+
+    def __init__(self, parent: tk.Tk, user_name: str, required_keystrokes: int,
+                 max_dwell_ms: float = 600.0, max_flight_ms: float = 1500.0):
+        self.parent = parent
+        self.user_name = user_name
+        self.required_keystrokes = max(1, int(required_keystrokes))
+        self.max_dwell_ms = float(max_dwell_ms)
+        self.max_flight_ms = float(max_flight_ms)
+        self.dialog: Optional[tk.Toplevel] = None
+        self.samples: list = []
+        self.cancelled = False
+        self._recorder = None
+        self._text: Optional[tk.Text] = None
+        self._progress: Optional[ttk.Progressbar] = None
+        self._progress_label: Optional[tk.Label] = None
+        self._save_button: Optional[tk.Button] = None
+        self._tick_job = None
+
+    def show(self) -> list:
+        """Öffnet den Dialog und gibt die gesammelte Probe (Liste) zurück."""
+        self.dialog = tk.Toplevel(self.parent)
+        self.dialog.title("Tippmuster trainieren")
+        self.dialog.configure(bg=ModernColors.SURFACE)
+        self.dialog.resizable(False, False)
+        self.dialog.transient(self.parent)
+        self.dialog.grab_set()
+
+        tk.Label(
+            self.dialog,
+            text=f"Tippmuster für '{self.user_name}' anlernen",
+            font=("Arial", 13, "bold"),
+            bg=ModernColors.SURFACE, fg=ModernColors.TEXT_PRIMARY,
+        ).pack(pady=(16, 4), padx=20)
+
+        tk.Label(
+            self.dialog,
+            text=("Tippen Sie unten natürlichen Text in Ihrem gewohnten Rhythmus.\n"
+                  "Es werden nur Zeitabstände gemessen – kein Inhalt gespeichert."),
+            font=("Arial", 10),
+            bg=ModernColors.SURFACE, fg=ModernColors.TEXT_SECONDARY,
+            justify="center",
+        ).pack(pady=(0, 8), padx=20)
+
+        tk.Label(
+            self.dialog,
+            text=self._PRACTICE_TEXT,
+            font=("Arial", 9, "italic"),
+            bg=ModernColors.SURFACE, fg=ModernColors.TEXT_SECONDARY,
+            justify="left", wraplength=420,
+        ).pack(pady=(0, 8), padx=20)
+
+        self._text = tk.Text(
+            self.dialog, height=5, width=52, font=("Arial", 11),
+            bg=ModernColors.BACKGROUND, bd=2, relief=tk.SUNKEN, wrap=tk.WORD,
+        )
+        self._text.pack(pady=(0, 8), padx=20, fill=tk.X)
+        self._text.focus_set()
+
+        try:
+            from keystroke_dynamics import KeystrokeRecorder
+            self._recorder = KeystrokeRecorder(
+                max_dwell_ms=self.max_dwell_ms, max_flight_ms=self.max_flight_ms)
+            self._recorder.attach(self._text)
+        except Exception as exc:  # pragma: no cover - defensiv
+            logger.debug("Keystroke-Recorder nicht aktiv: %s", exc)
+            self._recorder = None
+
+        self._progress = ttk.Progressbar(
+            self.dialog, maximum=self.required_keystrokes, length=420)
+        self._progress.pack(pady=(0, 2), padx=20, fill=tk.X)
+
+        self._progress_label = tk.Label(
+            self.dialog, text=self._progress_text(0),
+            font=("Arial", 10, "bold"),
+            bg=ModernColors.SURFACE, fg=ModernColors.PRIMARY,
+        )
+        self._progress_label.pack(pady=(0, 6))
+
+        button_frame = tk.Frame(self.dialog, bg=ModernColors.SURFACE)
+        button_frame.pack(pady=(4, 16))
+
+        self._save_button = tk.Button(
+            button_frame, text="Profil speichern", command=self._save,
+            bg=ModernColors.PRIMARY, fg=ModernColors.TEXT_ON_PRIMARY,
+            font=("Arial", 10, "bold"), relief=tk.FLAT, padx=14, pady=6,
+            state=tk.DISABLED,
+        )
+        self._save_button.pack(side=tk.LEFT, padx=6)
+
+        tk.Button(
+            button_frame, text="Abbrechen", command=self._cancel,
+            bg=ModernColors.SURFACE, fg=ModernColors.TEXT_PRIMARY,
+            font=("Arial", 10), relief=tk.FLAT, padx=14, pady=6,
+        ).pack(side=tk.LEFT, padx=6)
+
+        self.dialog.protocol("WM_DELETE_WINDOW", self._cancel)
+        self._center()
+        self._schedule_tick()
+        self.parent.wait_window(self.dialog)
+        return self.samples
+
+    def _progress_text(self, count: int) -> str:
+        return f"{count} von {self.required_keystrokes} Anschlägen erfasst"
+
+    def _schedule_tick(self):
+        if self.dialog is None:
+            return
+        self._tick()
+        self._tick_job = self.dialog.after(300, self._schedule_tick)
+
+    def _tick(self):
+        count = self._recorder.sample_size if self._recorder is not None else 0
+        if self._progress is not None:
+            self._progress.config(value=min(count, self.required_keystrokes))
+        if self._progress_label is not None:
+            self._progress_label.config(text=self._progress_text(count))
+        if self._save_button is not None:
+            self._save_button.config(
+                state=tk.NORMAL if count >= self.required_keystrokes else tk.DISABLED)
+
+    def _save(self):
+        if self._recorder is None:
+            return
+        sample = self._recorder.take_sample(self.required_keystrokes)
+        if sample is None:
+            return
+        self.samples = [sample]
+        self._close()
+
+    def _cancel(self):
+        self.cancelled = True
+        self.samples = []
+        self._close()
+
+    def _close(self):
+        if self._tick_job is not None and self.dialog is not None:
+            try:
+                self.dialog.after_cancel(self._tick_job)
+            except Exception:
+                pass
+            self._tick_job = None
+        if self.dialog:
+            self.dialog.destroy()
+
+    def _center(self):
+        if not self.dialog:
+            return
+        self.dialog.update_idletasks()
+        w = self.dialog.winfo_width()
+        h = self.dialog.winfo_height()
+        x = (self.dialog.winfo_screenwidth() // 2) - (w // 2)
+        y = (self.dialog.winfo_screenheight() // 2) - (h // 2)
+        self.dialog.geometry(f"+{x}+{y}")
+
 
 # Export für Kompatibilität
 PinDialog = SimplePinDialog

@@ -25,6 +25,7 @@ def _install_import_stubs():
     simple_ui_stub.LoginDialog = _Dialog
     simple_ui_stub.FirstRunWizard = _Dialog
     simple_ui_stub.MasterPasswordSetupDialog = _Dialog
+    simple_ui_stub.KeystrokeEnrollmentDialog = _Dialog
     simple_ui_stub.show_recovery_code = lambda *args, **kwargs: None
     for name, module in {
         "simple_ui": simple_ui_stub,
@@ -41,6 +42,7 @@ def _install_import_stubs():
 
     face_stub = types.ModuleType("face_mediapipe")
     face_stub.safe_face_encodings_from_file = lambda *args, **kwargs: []
+    face_stub.safe_face_enrollment_from_file = lambda *args, **kwargs: {"encodings": [], "geometry": []}
     sys.modules["face_mediapipe"] = face_stub
 
     class _PystrayIcon:
@@ -211,6 +213,14 @@ def app():
     app.session_start = 0.0
     app.active_threads = []
     app.current_user = "alice"
+    # Tippmuster-/Fusionszustand (2. Überwachungsfaktor).
+    app.keystroke_monitor = None
+    app._keystroke_profiles_cache = []
+    app.last_face_seen_at = 0.0
+    app.last_keystroke_match_at = 0.0
+    app.last_keystroke_intruder_at = 0.0
+    app.keystroke_matched_user = None
+    app.face_presence_ttl = 4.0
     app._refresh_user_list = Mock()
     app._stop_monitoring = Mock()
     app._activate_security_lock = Mock()

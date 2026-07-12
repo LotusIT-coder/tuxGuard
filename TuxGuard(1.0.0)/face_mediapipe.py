@@ -35,6 +35,20 @@ import numpy as np
 
 logger = logging.getLogger("TuxGuard.FaceBackend")
 
+
+def _config_value(name: str, default: float) -> float:
+    """Liest ein Tunable aus der zentralen Config (lazy, optional).
+
+    Das Modul bleibt ohne Config lauffähig (z. B. isolierter Worker-Prozess
+    oder Tests); dann gelten die eingebauten Standardwerte.
+    """
+    try:
+        from config import Config  # lokaler Import vermeidet harte Abhängigkeit
+        return float(getattr(Config, name, default))
+    except Exception:  # pylint: disable=broad-except
+        return float(default)
+
+
 # ---------------------------------------------------------------------------
 # Konstanten
 # ---------------------------------------------------------------------------
@@ -65,11 +79,21 @@ _NOSE_TIP_LANDMARK = 1
 _CHIN_LANDMARK = 152
 _FOREHEAD_LANDMARK = 10
 
-_EmotionDetection = Tuple[
+# Stabile, weit auseinanderliegende Landmarks zur kanonischen Normalisierung
+# der 3D-Geometrie (Augen außen, Nasenspitze, Mundwinkel, Kinn, Stirn).
+_GEOMETRY_ANCHOR_LANDMARKS = (33, 263, 1, 61, 291, 152, 10, 199)
+
+# Eine 4-Tuple-Detektion: (bbox, landmarks_or_None, blendshapes_or_None,
+# transform_matrix_or_None). ``transform_matrix`` ist die 4×4 Kopf-Pose-Matrix
+# des FaceLandmarkers (nur bei MediaPipe-Detektionen vorhanden).
+_FaceDetection = Tuple[
     Tuple[int, int, int, int],
     Optional[object],
     Optional[Dict[str, float]],
+    Optional[np.ndarray],
 ]
+# Rückwärtskompatibler Alias.
+_EmotionDetection = _FaceDetection
 
 # ---------------------------------------------------------------------------
 # Haar-Cascades (Fallback)
@@ -224,16 +248,20 @@ def _ensure_landmarker():
             _MP_AVAILABLE = False
             return None
 
+        # Konfigurierbare Mindest-Konfidenz: 0.3 war zu tolerant und führte
+        # zu Phantomdetektionen in strukturierten Hintergründen.
+        confidence = max(0.05, min(0.95, _config_value("FACE_DETECTION_MIN_CONFIDENCE", 0.5)))
+
         def _create(path: Path, with_blendshapes: bool):
             options = mp_vision.FaceLandmarkerOptions(
                 base_options=mp_python.BaseOptions(model_asset_path=str(path)),
                 running_mode=mp_vision.RunningMode.IMAGE,
                 num_faces=4,
-                min_face_detection_confidence=0.3,
-                min_face_presence_confidence=0.3,
-                min_tracking_confidence=0.3,
+                min_face_detection_confidence=confidence,
+                min_face_presence_confidence=confidence,
+                min_tracking_confidence=confidence,
                 output_face_blendshapes=with_blendshapes,
-                output_facial_transformation_matrixes=False,
+                output_facial_transformation_matrixes=True,
             )
             return mp_vision.FaceLandmarker.create_from_options(options)
 
@@ -352,6 +380,7 @@ def _detect_with_mediapipe(
     detections: List[_EmotionDetection] = []
     landmarks_list = list(result.face_landmarks or [])
     blendshapes_list = list(result.face_blendshapes or [])
+    transform_list = list(getattr(result, "facial_transformation_matrixes", None) or [])
     for index, landmarks in enumerate(landmarks_list):
         try:
             bbox = _bbox_from_landmarks(landmarks, width, height)
@@ -371,7 +400,15 @@ def _detect_with_mediapipe(
                             continue
                         score = float(getattr(category, "score", 0.0) or 0.0)
                         blendshape_scores[name] = max(0.0, min(1.0, score))
-                detections.append((bbox, landmarks, blendshape_scores))
+                transform = None
+                if index < len(transform_list):
+                    try:
+                        transform = np.asarray(transform_list[index], dtype=np.float64)
+                        if transform.shape != (4, 4):
+                            transform = None
+                    except Exception:  # pylint: disable=broad-except
+                        transform = None
+                detections.append((bbox, landmarks, blendshape_scores, transform))
         except Exception as exc:  # pylint: disable=broad-except
             logger.debug("Landmark-Auswertung fehlgeschlagen: %s", exc)
     return detections
@@ -412,13 +449,13 @@ def _detect_with_cascades(image: np.ndarray) -> List[Tuple[int, int, int, int]]:
             _add(x, y, w, h)
 
         for x, y, w, h in _get_profile_cascade().detectMultiScale(
-            gray, scaleFactor=1.08, minNeighbors=3, minSize=(48, 48)
+            gray, scaleFactor=1.08, minNeighbors=4, minSize=(48, 48)
         ):
             _add(x, y, w, h)
 
         flipped = cv2.flip(gray, 1)
         for x, y, w, h in _get_profile_cascade().detectMultiScale(
-            flipped, scaleFactor=1.08, minNeighbors=3, minSize=(48, 48)
+            flipped, scaleFactor=1.08, minNeighbors=4, minSize=(48, 48)
         ):
             _add(width - (x + w), y, w, h)
 
@@ -431,11 +468,11 @@ def _detect_with_cascades(image: np.ndarray) -> List[Tuple[int, int, int, int]]:
             )
             rotated_hits: List[Tuple[int, int, int, int]] = []
             for x, y, w, h in _get_face_cascade().detectMultiScale(
-                rotated, scaleFactor=1.1, minNeighbors=4, minSize=(48, 48)
+                rotated, scaleFactor=1.1, minNeighbors=5, minSize=(48, 48)
             ):
                 rotated_hits.append((x, y, w, h))
             for x, y, w, h in _get_profile_cascade().detectMultiScale(
-                rotated, scaleFactor=1.08, minNeighbors=3, minSize=(48, 48)
+                rotated, scaleFactor=1.08, minNeighbors=4, minSize=(48, 48)
             ):
                 rotated_hits.append((x, y, w, h))
             for x, y, w, h in rotated_hits:
@@ -537,10 +574,23 @@ def _detect_faces_with_landmarks(
     # FaceLandmarker (frontal-orientiert) nicht erkennt. Wenn MediaPipe
     # gar nicht verfügbar ist, ist sie der primäre Backend.
     cascade_boxes = _detect_with_cascades(image)
-    for box in cascade_boxes:
+    # Solange MediaPipe aktiv ist, sind Cascade-Treffer nur Ergänzung –
+    # dann muss sich ein Kandidat durch mindestens einen weiteren,
+    # überlappenden Treffer eines anderen Durchlaufs bestätigen. Einzelne,
+    # unbestätigte Cascade-Treffer sind überwiegend Phantomgesichter.
+    cascade_is_fallback = _MP_AVAILABLE is False
+    for index, box in enumerate(cascade_boxes):
         if any(_box_overlap(box, existing) >= 0.4 for existing in mp_boxes):
             continue
-        detections.append((box, None, None))
+        if not cascade_is_fallback:
+            votes = sum(
+                1
+                for other_index, other in enumerate(cascade_boxes)
+                if other_index != index and _box_overlap(box, other) >= 0.5
+            )
+            if votes < 1:
+                continue
+        detections.append((box, None, None, None))
 
     # Deduplizierung über alle Detektionen
     deduped: List[_EmotionDetection] = []
@@ -548,6 +598,18 @@ def _detect_faces_with_landmarks(
         if any(_box_overlap(det[0], existing[0]) >= 0.5 for existing in deduped):
             continue
         deduped.append(det)
+
+    # Winzige Boxen sind bei einer Desktop-Kamera keine plausiblen Nutzer-
+    # Gesichter, sondern fast immer Fehldetektionen im Hintergrund.
+    height, width = image.shape[:2]
+    min_rel = max(0.0, min(0.5, _config_value("FACE_MIN_RELATIVE_SIZE", 0.08)))
+    min_side = min_rel * float(min(height, width))
+    if min_side > 0:
+        deduped = [
+            det for det in deduped
+            if (det[0][2] - det[0][0]) >= min_side
+            and (det[0][1] - det[0][3]) >= min_side
+        ]
 
     # Nach Fläche absteigend sortieren – größere Gesichter sind verlässlicher.
     deduped.sort(
@@ -663,7 +725,7 @@ def load_image_file(file_path: str) -> np.ndarray:
 
 def face_locations(image: np.ndarray) -> List[Tuple[int, int, int, int]]:
     """Liefert erkannte Gesichter als Tupel ``(top, right, bottom, left)``."""
-    return [bbox for bbox, _, _ in _detect_faces_with_landmarks(image)]
+    return [bbox for bbox, _, _, _ in _detect_faces_with_landmarks(image)]
 
 
 def face_encodings(
@@ -679,7 +741,7 @@ def face_encodings(
     """
     detections = _detect_faces_with_landmarks(image)
     encodings: List[np.ndarray] = []
-    for bbox, landmarks, _ in detections:
+    for bbox, landmarks, _, _ in detections:
         aligned: Optional[np.ndarray] = None
         if landmarks is not None:
             aligned = _align_with_landmarks(image, landmarks)
@@ -693,19 +755,135 @@ def face_encodings(
     return encodings
 
 
+def landmarks_to_xyz(landmarks: Sequence) -> np.ndarray:
+    """Wandelt MediaPipe-Landmarks in ein ``(N, 3)``-Array (x, y, z) um.
+
+    Die Koordinaten sind die normalisierten MediaPipe-Werte (x, y in [0, 1]
+    relativ zur Bildbreite/-höhe, z als relative Tiefe in vergleichbarer
+    Skala wie x). Liefert ein leeres Array, wenn keine 3D-Punkte vorliegen.
+    """
+    try:
+        return np.array(
+            [(float(p.x), float(p.y), float(p.z)) for p in landmarks],
+            dtype=np.float64,
+        )
+    except Exception:  # pylint: disable=broad-except
+        return np.empty((0, 3), dtype=np.float64)
+
+
+def face_geometry(image: np.ndarray) -> List[np.ndarray]:
+    """Liefert pro erkanntem Gesicht die rohe 3D-Landmark-Geometrie ``(N, 3)``.
+
+    Nur MediaPipe-Detektionen besitzen 3D-Landmarks; Cascade-Fallback-
+    Detektionen werden übersprungen. Die Reihenfolge entspricht
+    ``face_locations(image)`` für die MediaPipe-Treffer.
+    """
+    geometries: List[np.ndarray] = []
+    for _, landmarks, _, _ in _detect_faces_with_landmarks(image):
+        if landmarks is None:
+            continue
+        xyz = landmarks_to_xyz(landmarks)
+        if xyz.size:
+            geometries.append(xyz)
+    return geometries
+
+
+def face_analysis_full(image: np.ndarray) -> List[Dict[str, object]]:
+    """Konsolidierte Einzeldetektion: alle Merkmale pro Gesicht in einem Pass.
+
+    Liefert pro Gesicht ein Dict mit:
+        ``bbox``         – (top, right, bottom, left)
+        ``encoding``     – 1280-D Kodierung oder ``None``
+        ``landmarks3d``  – ``(N, 3)``-Array oder ``None`` (nur MediaPipe)
+        ``blendshapes``  – Dict[str, float] (ggf. leer)
+        ``transform``    – 4×4 Kopf-Pose-Matrix oder ``None``
+
+    Dient der Kamera-Pipeline, um Identitäts-, Emotions- und
+    Liveness-Auswertung aus einer einzigen Detektion zu speisen.
+    """
+    results: List[Dict[str, object]] = []
+    for bbox, landmarks, blendshapes, transform in _detect_faces_with_landmarks(image):
+        aligned: Optional[np.ndarray] = None
+        if landmarks is not None:
+            aligned = _align_with_landmarks(image, landmarks)
+        if aligned is None:
+            aligned = _align_with_bbox(image, bbox)
+        encoding = _encode_aligned(aligned) if aligned is not None else None
+        landmarks3d = landmarks_to_xyz(landmarks) if landmarks is not None else None
+        if landmarks3d is not None and landmarks3d.size == 0:
+            landmarks3d = None
+        results.append(
+            {
+                "bbox": bbox,
+                "encoding": encoding,
+                "landmarks3d": landmarks3d,
+                "blendshapes": dict(blendshapes) if blendshapes else {},
+                "transform": transform,
+            }
+        )
+    return results
+
+
+def _blockwise_squared_diff(diff: np.ndarray) -> Optional[np.ndarray]:
+    """Zerlegt die Differenz zweier 1280-D-Kodierungen in 16 Gesichtsregionen.
+
+    Die Kodierung besteht aus einem 32×32-Intensitätsraster (1024 Werte) und
+    einem 16×16-Gradientenraster (256 Werte). Beide werden in ein räumlich
+    deckungsgleiches 4×4-Regionenraster aufgeteilt; zurückgegeben wird die
+    quadrierte Abweichung je Region.
+    """
+    if diff.shape != (1280,):
+        return None
+    intensity = diff[:1024].reshape(32, 32)
+    gradient = diff[1024:].reshape(16, 16)
+    intensity_blocks = (
+        intensity.reshape(4, 8, 4, 8).transpose(0, 2, 1, 3).reshape(16, -1)
+    )
+    gradient_blocks = (
+        gradient.reshape(4, 4, 4, 4).transpose(0, 2, 1, 3).reshape(16, -1)
+    )
+    return (
+        np.square(intensity_blocks).sum(axis=1)
+        + np.square(gradient_blocks).sum(axis=1)
+    )
+
+
 def face_distance(
     known_encodings: List[np.ndarray],
     face_encoding: np.ndarray,
 ) -> np.ndarray:
-    """Euklidischer Abstand zwischen bekannten Kodierungen und einer neuen."""
+    """Verdeckungsrobuster Abstand zwischen Kodierungen.
+
+    Für die 1280-D-Standardkodierung wird die Distanz blockweise über 16
+    Gesichtsregionen berechnet; die am stärksten abweichenden Regionen
+    (Anteil ``FACE_MATCH_OCCLUSION_TRIM``) werden verworfen und das Ergebnis
+    auf die volle Fläche reskaliert. Dadurch bleibt ein Gesicht auch mit
+    Teilverdeckung (Headset, Brille, Mikrofonbügel) erkennbar, während
+    fremde Gesichter – deren Abweichung über alle Regionen verteilt ist –
+    weiterhin deutlich über der Toleranz liegen.
+
+    Für abweichende Kodierungsformate wird der euklidische Abstand genutzt.
+    """
     if not known_encodings:
         return np.array([])
+
+    trim_ratio = max(0.0, min(0.4, _config_value("FACE_MATCH_OCCLUSION_TRIM", 0.25)))
     distances = []
     for known in known_encodings:
         if known.shape != face_encoding.shape:
             distances.append(float("inf"))
             continue
-        distances.append(float(np.linalg.norm(known - face_encoding)))
+        diff = (known - face_encoding).astype(np.float64, copy=False)
+        blocks = _blockwise_squared_diff(diff) if trim_ratio > 0 else None
+        if blocks is None:
+            distances.append(float(np.linalg.norm(diff)))
+            continue
+        total = blocks.shape[0]
+        keep = max(8, total - int(round(total * trim_ratio)))
+        kept = np.sort(blocks)[:keep]
+        # Reskalierung auf die volle Regionenzahl hält die Distanz
+        # vergleichbar mit der bisherigen L2-Skala (Toleranz unverändert).
+        distances.append(float(np.sqrt(kept.sum() * (total / float(keep)))))
     return np.array(distances, dtype=np.float64)
 
 
@@ -834,7 +1012,7 @@ def face_emotions(
     detections = _detect_faces_with_landmarks(image)
     emotions: List[Dict[str, object]] = []
     threshold = float(max(0.0, min(1.0, min_confidence)))
-    for bbox, _, blendshape_scores in detections:
+    for bbox, _, blendshape_scores, _ in detections:
         result = _infer_emotion_from_blendshapes(blendshape_scores, threshold)
         result["bbox"] = bbox
         emotions.append(result)
@@ -919,6 +1097,58 @@ def safe_face_analysis_from_file(file_path: str, timeout: int = 30) -> Dict[str,
     return {
         "encodings": [np.array(encoding, dtype=np.float64) for encoding in payload.get("encodings", [])],
         "emotions": payload.get("emotions", []),
+    }
+
+
+def safe_face_enrollment_from_file(file_path: str, timeout: int = 45) -> Dict[str, object]:
+    """Liefert Kodierungen UND 3D-Geometrie aus einer Bilddatei (isolierter Prozess).
+
+    Wird beim Hinzufügen von Trainingsbildern genutzt, um zusätzlich zur
+    1280-D Kodierung das 3D-Referenzmodell des Nutzers aufzubauen.
+    """
+    if not _WORKER_SCRIPT.exists():
+        raise FileNotFoundError(f"Worker-Skript nicht gefunden: {_WORKER_SCRIPT}")
+
+    try:
+        result = subprocess.run(
+            [sys.executable, str(_WORKER_SCRIPT), file_path, "--with-geometry"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Gesichtserfassung hat das Zeitlimit überschritten.") from exc
+
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+
+    if result.returncode != 0:
+        details = f"Worker beendet mit Code {result.returncode}"
+        if stdout:
+            try:
+                payload = json.loads(stdout)
+                details = payload.get("error", details)
+            except json.JSONDecodeError:
+                details = stdout.splitlines()[-1]
+        elif stderr:
+            details = stderr.splitlines()[-1]
+        raise RuntimeError(f"Gesichtserfassung fehlgeschlagen: {details}")
+
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Ungültige Antwort vom Gesichtserfassungs-Worker.") from exc
+
+    return {
+        "encodings": [
+            np.array(encoding, dtype=np.float64)
+            for encoding in payload.get("encodings", [])
+        ],
+        "geometry": [
+            np.array(geom, dtype=np.float64)
+            for geom in payload.get("geometry", [])
+        ],
     }
 
 

@@ -51,6 +51,99 @@ class Config:
 
     # Gesichtsabgleich: maximale Distanz zwischen Kodierungen (kleiner = strenger)
     FACE_MATCH_TOLERANCE = 0.9
+    # Mindest-Konfidenz der MediaPipe-Gesichtsdetektion [0..1].
+    # Höher = weniger Phantomgesichter, niedriger = empfindlicher.
+    FACE_DETECTION_MIN_CONFIDENCE = 0.5
+    # Mindestgröße eines Gesichts relativ zur kleineren Bildkante [0..0.5].
+    # Filtert winzige Fehldetektionen (z. B. Muster im Hintergrund).
+    FACE_MIN_RELATIVE_SIZE = 0.08
+    # Anteil der am stärksten abweichenden Gesichtsregionen, der beim Abgleich
+    # ignoriert wird [0..0.4]. Macht die Wiedererkennung robust gegen
+    # Teilverdeckungen wie Headsets, Brillen oder Mikrofonbügel.
+    FACE_MATCH_OCCLUSION_TRIM = 0.25
+    
+    # ------------------------------------------------------------------
+    # Liveness / Anti-Spoofing (verhindert Überlistung per 2D-Foto)
+    # ------------------------------------------------------------------
+    LIVENESS_ENABLED = True
+    # Passive Textur-/Moiré-Analyse: Mindest-Echtheitsscore [0..1]
+    LIVENESS_TEXTURE_MIN_SCORE = 0.45
+    # Blinzel-Erkennung
+    LIVENESS_REQUIRE_BLINK = True
+    LIVENESS_BLINK_CLOSE_THRESHOLD = 0.45
+    LIVENESS_BLINK_OPEN_THRESHOLD = 0.20
+    LIVENESS_BLINK_WINDOW_SECONDS = 8.0
+    # Bewegungs-Parallaxe (Tiefe aus Bewegung)
+    LIVENESS_REQUIRE_PARALLAX = True
+    LIVENESS_PARALLAX_MIN_YAW_RANGE = 8.0
+    LIVENESS_PARALLAX_MIN_SLOPE = 0.004
+    LIVENESS_MOTION_WINDOW_SECONDS = 6.0
+    # 3D-Geometrie-Konsistenz gegen das hinterlegte Referenzmodell
+    LIVENESS_GEOMETRY_MAX_RMS = 0.18
+    LIVENESS_GEOMETRY_REQUIRED = False
+    # Harte Fehlgründe (Textur/Geometrie/Parallaxe) müssen über diese Zeit
+    # anhalten, bevor sie als echter Spoof gewertet werden.
+    LIVENESS_SPOOF_GRACE_SECONDS = 2.5
+    # Kürzlich als "live" bestätigte Nutzer bleiben bei kurzen Aussetzern
+    # innerhalb dieses Zeitfensters im Pending-Zustand statt sofort auf Spoof.
+    LIVENESS_RECENT_LIVE_TTL_SECONDS = 2.0
+    # Aktive Challenge (z. B. "bitte blinzeln / Kopf drehen")
+    LIVENESS_ACTIVE_CHALLENGE_ENABLED = True
+    LIVENESS_CHALLENGE_TIMEOUT_SECONDS = 12.0
+    LIVENESS_CHALLENGE_TURN_YAW_DEGREES = 15.0
+    
+    # ------------------------------------------------------------------
+    # Tippmustererkennung (Keystroke Dynamics) – 2. Faktor der Dauerüberwachung
+    # ------------------------------------------------------------------
+    KEYSTROKE_DYNAMICS_ENABLED = True
+    # Systemweite Erfassung (nur Zeitabstände, nie Zeichen). Fehlt pynput oder
+    # die Rechte, degradiert TuxGuard automatisch (kein zweiter Faktor).
+    KEYSTROKE_GLOBAL_CAPTURE = True
+    # Anschläge für ein vollständiges Referenzprofil (Anlernen, je Nutzer)
+    KEYSTROKE_MIN_ENROLLMENT_KEYSTROKES = 200
+    # Fenstergröße einer Live-Probe während der Überwachung
+    KEYSTROKE_MATCH_WINDOW_KEYSTROKES = 30
+    # Obergrenze adaptiv gelernter Anschläge (hält neue Eingaben wirksam)
+    KEYSTROKE_MAX_PROFILE_KEYSTROKES = 2000
+    # Schwellwert der normierten Distanz (kleiner = strenger)
+    KEYSTROKE_MATCH_THRESHOLD = 1.8
+    # Konfidenzschwelle für das Anschlagen bei fremdem Tippmuster [0..1].
+    # Unterhalb dieses Werts wird ein nicht passendes Muster als Eindringling
+    # gewertet; darüber bleibt es zunächst nur ein unscharfer Fehlmatch.
+    KEYSTROKE_INTRUDER_CONFIDENCE_THRESHOLD = 0.35
+    # Plausibilitätsgrenzen (größere Werte beenden einen Tipplauf)
+    KEYSTROKE_MAX_DWELL_MS = 600.0
+    KEYSTROKE_MAX_FLIGHT_MS = 1500.0
+    # Untergrenze der Streuung im Distanzmaß (verhindert Überstrenge)
+    KEYSTROKE_STD_FLOOR_MS = 8.0
+    # Profil mit bestätigten Live-Proben nachschärfen (adaptives Lernen)
+    KEYSTROKE_ADAPTIVE_LEARNING = True
+    # Wie lange eine bestätigte Tippprobe als „präsent" gilt (Sekunden)
+    KEYSTROKE_PRESENCE_TTL_SECONDS = 90
+    # Wie lange ein fremdes Tippmuster als „Eindringling" nachwirkt (Sekunden)
+    KEYSTROKE_INTRUDER_TTL_SECONDS = 30
+
+    # ------------------------------------------------------------------
+    # Mehrfaktor-Fusion der Dauerüberwachung (Gesicht + Tippmuster)
+    # ------------------------------------------------------------------
+    # Wie schnell ein Gesicht ohne neue Erkennung als „weg" gilt (Sekunden)
+    FACE_PRESENCE_TTL_SECONDS = 4
+    # Fusionsstrategie der beiden Faktoren:
+    #   "face_only"      – nur Gesicht entscheidet (Tippmuster nur protokollieren)
+    #   "keystroke_only" – nur Tippmuster entscheidet
+    #   "any"            – präsent, wenn EIN Faktor erkennt (tolerant)
+    #   "all"            – präsent nur, wenn Gesicht UND Tippmuster passen (streng)
+    #   "priority"       – Primärfaktor entscheidet, Sekundärfaktor als Rückfall
+    PRESENCE_FUSION_MODE = "priority"
+    # Primärfaktor für "priority": "face" oder "keystroke"
+    PRESENCE_PRIMARY_FACTOR = "face"
+    # Reaktion, wenn das Gesicht nicht mehr erkannt wird:
+    #   "lock" (Sperrbildschirm) | "warn" (nur warnen) | "ignore" | "deadman"
+    PRESENCE_ON_FACE_LOST = "lock"
+    # Reaktion bei fremdem Tippmuster (anderer Tipprhythmus):
+    PRESENCE_ON_KEYSTROKE_INTRUDER = "lock"
+    # Reaktion, wenn das passende Tippmuster ausbleibt (idR neutral lassen):
+    PRESENCE_ON_KEYSTROKE_LOST = "ignore"
     
     # Adaptives Lernen
     ADAPTIVE_RETRAIN_INTERVAL = 10

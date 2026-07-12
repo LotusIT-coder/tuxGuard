@@ -23,8 +23,16 @@ from face_mediapipe import (
     face_locations as mp_face_locations,
     face_encodings as mp_face_encodings,
     face_emotions as mp_face_emotions,
+    face_analysis_full,
     compare_faces,
     face_distance,
+)
+from face_liveness import (
+    LivenessConfig,
+    LivenessMonitor,
+    deserialize_geometry,
+    geometry_rms_distance,
+    texture_live_score,
 )
 import tkinter as tk
 from tkinter import messagebox, Toplevel, Label
@@ -100,6 +108,23 @@ class CameraManager:
         self._onnx_session = None
         self._init_emotion_backend()
         
+        # Liveness / Anti-Spoofing (gegen 2D-Foto-Angriffe)
+        self.liveness_enabled = bool(getattr(Config, "LIVENESS_ENABLED", True))
+        self.liveness_monitor = LivenessMonitor(self._build_liveness_config())
+        self.liveness_spoof_grace_seconds = float(
+            getattr(Config, "LIVENESS_SPOOF_GRACE_SECONDS", 2.5)
+        )
+        self.liveness_recent_live_ttl_seconds = float(
+            getattr(Config, "LIVENESS_RECENT_LIVE_TTL_SECONDS", 2.0)
+        )
+        self._geometry_models: Dict[str, np.ndarray] = {}
+        self._liveness_challenge_started = False
+        self._last_spoof_log_at = 0.0
+        self._last_live_user: Optional[str] = None
+        self._last_live_at = 0.0
+        self._hard_fail_user: Optional[str] = None
+        self._hard_fail_since: Optional[float] = None
+        
         # Callbacks
         self.user_recognized_callback: Optional[Callable[[str], None]] = None
         self.unauthorized_access_callback: Optional[Callable[[], None]] = None
@@ -155,6 +180,39 @@ class CameraManager:
                     self._onnx_session = None
         
         logger.info(f"Emotion-Backend aktiv: {self.emotion_backend}")
+
+    def _build_liveness_config(self) -> LivenessConfig:
+        """Erstellt die Liveness-Konfiguration aus den Config-Werten."""
+        return LivenessConfig(
+            enabled=bool(getattr(Config, "LIVENESS_ENABLED", True)),
+            texture_min_score=float(getattr(Config, "LIVENESS_TEXTURE_MIN_SCORE", 0.45)),
+            blink_close_threshold=float(getattr(Config, "LIVENESS_BLINK_CLOSE_THRESHOLD", 0.45)),
+            blink_open_threshold=float(getattr(Config, "LIVENESS_BLINK_OPEN_THRESHOLD", 0.20)),
+            require_blink=bool(getattr(Config, "LIVENESS_REQUIRE_BLINK", True)),
+            blink_window_seconds=float(getattr(Config, "LIVENESS_BLINK_WINDOW_SECONDS", 8.0)),
+            require_parallax=bool(getattr(Config, "LIVENESS_REQUIRE_PARALLAX", True)),
+            parallax_min_yaw_range=float(getattr(Config, "LIVENESS_PARALLAX_MIN_YAW_RANGE", 8.0)),
+            parallax_min_slope=float(getattr(Config, "LIVENESS_PARALLAX_MIN_SLOPE", 0.004)),
+            motion_window_seconds=float(getattr(Config, "LIVENESS_MOTION_WINDOW_SECONDS", 6.0)),
+            geometry_max_rms=float(getattr(Config, "LIVENESS_GEOMETRY_MAX_RMS", 0.18)),
+            geometry_required=bool(getattr(Config, "LIVENESS_GEOMETRY_REQUIRED", False)),
+            active_challenge_enabled=bool(getattr(Config, "LIVENESS_ACTIVE_CHALLENGE_ENABLED", True)),
+            challenge_timeout_seconds=float(getattr(Config, "LIVENESS_CHALLENGE_TIMEOUT_SECONDS", 12.0)),
+            challenge_turn_yaw_degrees=float(getattr(Config, "LIVENESS_CHALLENGE_TURN_YAW_DEGREES", 15.0)),
+        )
+
+    def _load_geometry_models(self) -> None:
+        """Lädt die hinterlegten 3D-Referenzmodelle pro Benutzer in den Cache."""
+        models: Dict[str, np.ndarray] = {}
+        try:
+            for name, blob, _num in self.db_manager.get_all_face_geometry_models():
+                geom = deserialize_geometry(blob)
+                if geom is not None:
+                    models[name] = geom
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.debug("3D-Modelle konnten nicht geladen werden: %s", exc)
+        self._geometry_models = models
+        logger.debug("3D-Referenzmodelle geladen: %s", len(models))
 
     def _infer_emotions_via_backend(
         self,
@@ -445,6 +503,13 @@ class CameraManager:
         self._emotion_alert_candidate = None
         self._emotion_alert_started_at = None
         self._emotion_alert_triggered = False
+        self.liveness_monitor.reset()
+        self._liveness_challenge_started = False
+        self._last_live_user = None
+        self._last_live_at = 0.0
+        self._hard_fail_user = None
+        self._hard_fail_since = None
+        self._load_geometry_models()
         self.camera_after_id = self.parent_window.after(0, self._run_camera_step)
         
         logger.info("Kamera-Aufnahme gestartet")
@@ -484,8 +549,51 @@ class CameraManager:
         face_names: List[str],
         face_emotions: Optional[List[Dict[str, object]]] = None,
     ) -> Image.Image:
-        """Erstellt eine neutrale Vorschau ohne sichtbare Erkennungsdetails."""
+        """Erstellt die Monitoring-Vorschau mit sichtbaren Erkennungsrahmen.
+
+        Die produktive Live-Ansicht soll denselben Erkennungsrahmen wie der
+        Testmodus zeigen, damit der Nutzer sofort sieht, welches Gesicht gerade
+        verfolgt und wie es benannt wird.
+        """
         preview_frame = frame.copy()
+
+        def _overlay_emotion_label(emotion: Optional[Dict[str, object]]) -> str:
+            if not emotion:
+                return ""
+            label = self._format_emotion_label(emotion)
+            return label
+
+        for idx, (top, right, bottom, left) in enumerate(face_locations):
+            name = face_names[idx] if idx < len(face_names) else "Unbekannt"
+            emotion_label = ""
+            if face_emotions is not None and idx < len(face_emotions):
+                emotion_label = _overlay_emotion_label(face_emotions[idx])
+
+            box_color = (76, 175, 80) if name != "Unbekannt" else (255, 82, 82)
+            cv2.rectangle(preview_frame, (left, top), (right, bottom), box_color, 2)
+
+            cv2.putText(
+                preview_frame,
+                f"Name: {name}",
+                (left, max(20, top - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                box_color,
+                2,
+                cv2.LINE_AA,
+            )
+
+            if emotion_label:
+                cv2.putText(
+                    preview_frame,
+                    emotion_label,
+                    (left, min(preview_frame.shape[0] - 10, bottom + 20)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
 
         display_rgb = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(display_rgb)
@@ -684,8 +792,14 @@ class CameraManager:
                 return
 
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            face_locations = mp_face_locations(rgb_frame)
-            face_encodings = mp_face_encodings(rgb_frame, face_locations)
+            # Eine konsolidierte Detektion liefert Bbox, Kodierung, 3D-Landmarks,
+            # Blendshapes und Kopf-Pose für Identitäts-, Emotions- und
+            # Liveness-Auswertung aus einem einzigen Durchlauf.
+            analysis = face_analysis_full(rgb_frame)
+            face_locations = [entry["bbox"] for entry in analysis]
+            face_encodings = [
+                entry["encoding"] for entry in analysis if entry["encoding"] is not None
+            ]
             raw_emotions = (
                 self._infer_emotions_via_backend(rgb_frame, face_locations)
                 if self.emotion_analysis_enabled
@@ -697,39 +811,73 @@ class CameraManager:
 
             user_recognized = False
             recognized_user = None
+            recognized_entry: Optional[Dict[str, object]] = None
             face_names: List[str] = []
 
-            if face_encodings:
+            if analysis:
                 known_encodings = self.db_manager.get_all_face_encodings()
                 tolerance = float(getattr(Config, "FACE_MATCH_TOLERANCE", 0.9))
 
-                for face_encoding in face_encodings:
+                for entry in analysis:
+                    face_encoding = entry["encoding"]
                     current_name = "Unbekannt"
-                    # Best-Match: kleinste Distanz über ALLE bekannten
-                    # Kodierungen statt erstem Treffer unter der Toleranz.
-                    best_name = None
-                    best_distance = float("inf")
-                    for name, known_encoding, desc in known_encodings:
-                        distances = face_distance([known_encoding], face_encoding)
-                        if distances.size and float(distances[0]) < best_distance:
-                            best_distance = float(distances[0])
-                            best_name = name
-                    if best_name is not None and best_distance <= tolerance:
-                        user_recognized = True
-                        recognized_user = best_name
-                        current_name = best_name
-                        self._log_user_recognized_throttled(best_name)
+                    if face_encoding is not None:
+                        # Best-Match: kleinste Distanz über ALLE bekannten
+                        # Kodierungen statt erstem Treffer unter der Toleranz.
+                        best_name = None
+                        best_distance = float("inf")
+                        for name, known_encoding, desc in known_encodings:
+                            distances = face_distance([known_encoding], face_encoding)
+                            if distances.size and float(distances[0]) < best_distance:
+                                best_distance = float(distances[0])
+                                best_name = name
+                        if best_name is not None and best_distance <= tolerance:
+                            user_recognized = True
+                            recognized_user = best_name
+                            recognized_entry = entry
+                            current_name = best_name
                     face_names.append(current_name)
 
                     if user_recognized:
                         break
 
-            current_state = 'authorized' if user_recognized else 'unauthorized'
+            # --- Liveness-/Anti-Spoofing-Gate -----------------------------
+            # Identität allein genügt nicht: Ein erkanntes Gesicht wird erst
+            # autorisiert, wenn es als "lebendig" bestätigt ist (kein 2D-Foto).
+            liveness_state = "live"  # live | pending | spoof
+            preview_prompt: Optional[str] = None
+            if user_recognized and self.liveness_enabled:
+                liveness_state, preview_prompt = self._evaluate_liveness(
+                    rgb_frame, recognized_user, recognized_entry
+                )
+            elif user_recognized:
+                # Liveness deaktiviert -> wie bisher allein über Identität.
+                self._log_user_recognized_throttled(recognized_user)
+
+            if user_recognized and self.liveness_enabled and liveness_state == "live":
+                self._log_user_recognized_throttled(recognized_user)
+
+            authorized = user_recognized and (
+                not self.liveness_enabled or liveness_state == "live"
+            )
+            is_spoof = (
+                user_recognized and self.liveness_enabled and liveness_state == "spoof"
+            )
+            is_pending = (
+                user_recognized and self.liveness_enabled and liveness_state == "pending"
+            )
+
+            if authorized:
+                current_state = "authorized"
+            elif is_pending:
+                current_state = "pending"
+            else:
+                current_state = "unauthorized"
             grace_period = 1.0
 
-            if face_locations:
-                preview_status = "Ueberwachung aktiv"
-                preview_level = "INFO"
+            if is_pending and preview_prompt:
+                preview_status = preview_prompt
+                preview_level = "WARN"
             else:
                 preview_status = "Ueberwachung aktiv"
                 preview_level = "INFO"
@@ -743,15 +891,23 @@ class CameraManager:
                 )
                 self.preview_updated_callback(preview_image, preview_status, preview_level)
 
-            # Heartbeat: jeder Frame mit legitimem Nutzer setzt den Sperr-Timer zurück,
-            # auch wenn die Erkennung nur kurz war (kein Warten auf Grace-Period).
-            if user_recognized and recognized_user and self.user_seen_callback:
+            # Heartbeat: ein wiedererkanntes Gesicht soll die Präsenz bereits
+            # dann halten, wenn die Liveness noch pending ist. Sonst läuft der
+            # Face-Timer während der Verifikation ab und die Überwachung sperrt
+            # trotz korrekter Gesichtserkennung.
+            if recognized_user and self.user_seen_callback and (authorized or is_pending):
                 try:
                     self.user_seen_callback(recognized_user)
                 except Exception as cb_exc:
                     logger.debug("user_seen_callback fehlgeschlagen: %s", cb_exc)
 
-            if self.state_candidate is None or current_state != self.state_candidate:
+            # Solange die Liveness-Prüfung läuft (Blinzeln/Bewegung/Challenge
+            # ausstehend), wird der Zustand "gehalten": weder autorisieren noch
+            # sofort als unautorisiert sperren. Bleibt der Zustand zu lange
+            # offen, greift die reguläre Sperrverzögerung der Anwendung.
+            if current_state == "pending":
+                self.state_candidate = None
+            elif self.state_candidate is None or current_state != self.state_candidate:
                 self.state_candidate = current_state
                 self.state_since = time.time()
             elif time.time() - self.state_since >= grace_period and self.last_state != self.state_candidate:
@@ -760,7 +916,9 @@ class CameraManager:
                         self.user_recognized_callback(recognized_user)
                 else:
                     if self.unauthorized_access_callback:
-                        if face_encodings:
+                        if is_spoof:
+                            self._log_spoof_attempt_throttled(recognized_user)
+                        elif face_encodings:
                             logger.warning("Unbekanntes Gesicht erkannt")
                         else:
                             logger.warning("Kein Gesicht erkannt (Kamera abgedeckt oder niemand im Bild)")
@@ -779,6 +937,105 @@ class CameraManager:
         if last_log_at is None or (now - last_log_at) >= min_interval:
             logger.info(f"Benutzer erkannt: {user_name}")
             self._last_user_recognized_log_at[user_name] = now
+
+    def _log_spoof_attempt_throttled(self, user_name: Optional[str]) -> None:
+        now = time.time()
+        if now - self._last_spoof_log_at >= 2.0:
+            logger.warning(
+                "Möglicher Spoofing-Versuch (2D-Foto?) für '%s' – Liveness fehlgeschlagen.",
+                user_name or "Unbekannt",
+            )
+            self._last_spoof_log_at = now
+
+    def _evaluate_liveness(
+        self,
+        rgb_frame: np.ndarray,
+        recognized_user: Optional[str],
+        entry: Optional[Dict[str, object]],
+    ) -> Tuple[str, Optional[str]]:
+        """Prüft die Lebendigkeit des erkannten Gesichts.
+
+        Liefert (zustand, prompt) mit zustand ∈ {"live", "pending", "spoof"}.
+        ``pending`` bedeutet: Identität stimmt, aber Liveness noch nicht
+        bestätigt (Blinzeln/Bewegung/Challenge ausstehend). ``spoof`` weist
+        auf ein wahrscheinliches 2D-Foto hin (Textur, Geometrie oder fehlende
+        Parallaxe trotz Kopfbewegung).
+        """
+        if entry is None:
+            return "pending", "Liveness-Pruefung laeuft …"
+
+        bbox = entry.get("bbox")  # type: ignore[assignment]
+        landmarks3d = entry.get("landmarks3d")
+        transform = entry.get("transform")
+        blendshapes = entry.get("blendshapes") or {}
+
+        texture_score = texture_live_score(rgb_frame, bbox) if bbox is not None else 0.5
+
+        geometry_rms: Optional[float] = None
+        model = self._geometry_models.get(recognized_user or "")
+        if model is not None and isinstance(landmarks3d, np.ndarray):
+            geometry_rms = geometry_rms_distance(model, landmarks3d)
+
+        # Aktive Challenge einmalig pro Sitzung anstoßen.
+        if (
+            self.liveness_monitor.config.active_challenge_enabled
+            and not self._liveness_challenge_started
+        ):
+            self.liveness_monitor.start_challenge()
+            self._liveness_challenge_started = True
+
+        result = self.liveness_monitor.update(
+            blendshapes if isinstance(blendshapes, dict) else {},
+            landmarks3d if isinstance(landmarks3d, np.ndarray) else None,
+            transform if isinstance(transform, np.ndarray) else None,
+            texture_score,
+            geometry_rms,
+        )
+
+        now = time.time()
+        if result.is_live:
+            self._last_live_user = recognized_user
+            self._last_live_at = now
+            self._hard_fail_user = None
+            self._hard_fail_since = None
+            return "live", None
+
+        hard_fail = {"textur", "geometrie", "keine_parallaxe"}
+        if any(reason in hard_fail for reason in result.reasons):
+            # Harte Fehlgründe nur dann als Spoof werten, wenn sie stabil über
+            # mehrere Frames anhalten. So führen kurze Tracking-Aussetzer
+            # (Bewegung, Headsetkante, Beleuchtungswechsel) nicht sofort zur Sperre.
+            if recognized_user != self._hard_fail_user:
+                self._hard_fail_user = recognized_user
+                self._hard_fail_since = now
+
+            fail_elapsed = 0.0
+            if self._hard_fail_since is not None:
+                fail_elapsed = max(0.0, now - self._hard_fail_since)
+
+            recent_live = (
+                recognized_user is not None
+                and recognized_user == self._last_live_user
+                and (now - self._last_live_at)
+                <= max(0.0, self.liveness_recent_live_ttl_seconds)
+            )
+            if recent_live or fail_elapsed < max(0.0, self.liveness_spoof_grace_seconds):
+                if "kein_blinzeln" in result.reasons:
+                    return "pending", "Bitte einmal blinzeln"
+                return "pending", "Liveness wird verifiziert ... bitte kurz ruhig bleiben"
+            return "spoof", None
+
+        self._hard_fail_user = None
+        self._hard_fail_since = None
+
+        # Sonst: Identität ok, aber Liveness noch nicht erbracht.
+        prompt = result.challenge_prompt
+        if not prompt:
+            if "kein_blinzeln" in result.reasons:
+                prompt = "Bitte einmal blinzeln"
+            else:
+                prompt = "Liveness-Pruefung laeuft …"
+        return "pending", prompt
     
     def capture_image(self) -> Optional[str]:
         """Nimmt ein Bild mit der Webcam auf und gibt den Pfad zurück.
