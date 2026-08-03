@@ -32,7 +32,7 @@ import logging
 import os
 import secrets
 import string
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -131,7 +131,7 @@ class MasterAuth:
             "password": hash_password(password),
             "additional_passwords": [],
             "recovery": hash_password(normalized),
-            "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
         })
         logger.info("Master-Credentials initialisiert (%s)", self.path)
         return code
@@ -221,7 +221,7 @@ class MasterAuth:
             "password": hash_password(new_password),
             "additional_passwords": additional,
             "recovery": hash_password(normalize_recovery_code(new_code)),
-            "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
         })
         logger.warning("Master-Passwort wurde per Recovery-Code zurückgesetzt.")
         return new_code

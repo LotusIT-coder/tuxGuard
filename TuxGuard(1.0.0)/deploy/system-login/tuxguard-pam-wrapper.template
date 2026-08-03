@@ -1,0 +1,24 @@
+#!/bin/bash
+# Wrapper für pam_exec -> tuxguard pam_connector_client.py
+# pam_exec mit expose_authtok liefert das Authtok auf STDIN (nicht als Env-Variable).
+# Es wird unverändert an den Client durchgereicht (nie als argv, nie in Shell-Variablen).
+
+set -eu
+
+PYTHON_BIN="/opt/tuxguard/.venv/bin/python"
+CLIENT="/opt/tuxguard/pam_connector_client.py"
+SOCKET_PATH="/run/tuxguard-authd.sock"
+
+USERNAME="${PAM_USER:-}"
+FRAME_PATH="${TUXGUARD_FRAME_PATH:-}"
+
+if [[ -z "${USERNAME}" || -z "${FRAME_PATH}" ]]; then
+  exit 1
+fi
+
+# stdin (Authtok von pam_exec) direkt an den Client weiterleiten.
+exec "${PYTHON_BIN}" "${CLIENT}" \
+  --username "${USERNAME}" \
+  --image-path "${FRAME_PATH}" \
+  --pin-stdin \
+  --socket "${SOCKET_PATH}"

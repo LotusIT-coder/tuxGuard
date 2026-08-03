@@ -38,6 +38,8 @@ class Config:
 
     # Master-Credential-Datei (vom Installer angelegt, enthält Master-Passwort + Recovery-Hash)
     MASTER_CREDENTIALS_FILE = _SCRIPT_DIR / "master_credentials.json"
+    # Laufzeit-Einstellungen (nicht sicherheitskritisch, z. B. Autostart-Präferenzen)
+    RUNTIME_SETTINGS_FILE = _SCRIPT_DIR / "runtime_settings.json"
     
     # Kameraeinstellungen
     CAMERA_DEVICE = "/dev/video0"
@@ -155,6 +157,27 @@ class Config:
     EMOTION_TRACK_MAX_DISTANCE = 90.0
     EMOTION_TRACK_TTL_SECONDS = 1.5
 
+    # ------------------------------------------------------------------
+    # Optionaler System-Login (PAM/Display-Manager Integration)
+    # ------------------------------------------------------------------
+    # Schaltet den optionalen Biometrie-Login-Dienst ein/aus.
+    SYSTEM_LOGIN_ENABLED = False
+    # Policy-Modus:
+    #   face_or_password    -> biometrisch versuchen, sonst Passwort-Fallback
+    #   face_and_pin        -> biometrisch + PIN als zweiter Faktor
+    #   password_only       -> Biometrie deaktiviert
+    SYSTEM_LOGIN_MODE = "face_or_password"
+    # Unix-Socket für lokalen Auth-Daemon.
+    SYSTEM_LOGIN_SOCKET_PATH = "/run/tuxguard-authd.sock"
+    # Standard-Timeout pro Auth-Anfrage (Sekunden).
+    SYSTEM_LOGIN_REQUEST_TIMEOUT_SECONDS = 8.0
+    # Standard-Schwelle für Face-Matching im System-Login.
+    SYSTEM_LOGIN_FACE_TOLERANCE = FACE_MATCH_TOLERANCE
+    # Maximalversuche pro Benutzer innerhalb des Fensterintervalls.
+    SYSTEM_LOGIN_MAX_ATTEMPTS = 5
+    SYSTEM_LOGIN_ATTEMPT_WINDOW_SECONDS = 60
+    SYSTEM_LOGIN_LOCKOUT_SECONDS = 120
+
     # Stufe 2: Dediziertes Emotion-Backend (blendshape oder onnx)
     EMOTION_BACKEND = "blendshape"  # "blendshape" oder "onnx" (ONNX=optional mit Fallback)
     EMOTION_ONNX_MODEL = MODELS_DIR / "emotion_fer_onnx.onnx"  # Optional FER-Modell
@@ -181,6 +204,7 @@ class Config:
     APP_ICON_PATH = _SCRIPT_DIR / "tux_256.png"
     MINIMIZE_BEHAVIOR = "tray"   # "tray" | "normal"
     CLOSE_BEHAVIOR = "ask"       # "ask" | "tray" | "quit"
+    AUTOSTART_MONITORING_DEFAULT = False
     
     # Systemtray
     TRAY_ICON_SIZE = (64, 64)

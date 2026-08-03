@@ -10,9 +10,12 @@ import time
 import threading
 import tempfile
 import os
+import json
 import logging
 import re
 import io
+import shlex
+import subprocess
 from pathlib import Path
 from typing import Optional, List
 
@@ -151,12 +154,26 @@ class TuxGuardApplication:
             self.logger.info("TuxGuard erfolgreich initialisiert (Benutzer: %s)", self.current_user)
             def _init_autostart_ui():
                 autostart_enabled = self._is_autostart_enabled()
-                if hasattr(self.ui, 'set_autostart_state'):
+                autostart_monitoring = self._load_autostart_monitoring_preference()
+                if hasattr(self.ui, 'set_autostart_settings'):
+                    self.ui.set_autostart_settings(autostart_enabled, autostart_monitoring)
+                elif hasattr(self.ui, 'set_autostart_state'):
                     self.ui.set_autostart_state(autostart_enabled)
-                if hasattr(self.ui, 'autostart_callback'):
+                if hasattr(self.ui, 'autostart_preferences_callback'):
+                    self.ui.autostart_preferences_callback = self._on_autostart_preferences_changed
+                elif hasattr(self.ui, 'autostart_callback'):
                     self.ui.autostart_callback = self._on_autostart_checkbox
-                # Autostart: Überwachungsmodus ggf. direkt aktivieren
-                if autostart_enabled and self._has_registered_users():
+                if hasattr(self.ui, 'system_login_callback'):
+                    self.ui.system_login_callback = self._on_system_login_preferences_changed
+
+                # Überwachung nur dann automatisch starten, wenn die App
+                # tatsächlich aus dem Autostart-Service gestartet wurde.
+                if (
+                    autostart_enabled
+                    and autostart_monitoring
+                    and self._is_started_from_autostart_service()
+                    and self._has_registered_users()
+                ):
                     self._start_monitoring()
             self.root.after(0, _init_autostart_ui)
         except Exception as e:
@@ -336,38 +353,148 @@ class TuxGuardApplication:
         import os
         return os.path.expanduser('~/.config/systemd/user/tuxguard.service')
 
+    def _load_runtime_settings(self) -> dict:
+        path = Path(getattr(Config, "RUNTIME_SETTINGS_FILE", Config._SCRIPT_DIR / "runtime_settings.json"))
+        if not path.exists():
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            return data if isinstance(data, dict) else {}
+        except Exception as exc:
+            self.logger.debug("Runtime-Settings konnten nicht gelesen werden: %s", exc)
+            return {}
+
+    def _save_runtime_settings(self, updates: dict) -> None:
+        path = Path(getattr(Config, "RUNTIME_SETTINGS_FILE", Config._SCRIPT_DIR / "runtime_settings.json"))
+        try:
+            current = self._load_runtime_settings()
+            current.update(updates)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(current, handle, indent=2)
+            os.replace(tmp, path)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+        except Exception as exc:
+            self.logger.warning("Runtime-Settings konnten nicht gespeichert werden: %s", exc)
+
+    def _load_autostart_monitoring_preference(self) -> bool:
+        settings = self._load_runtime_settings()
+        default = bool(getattr(Config, "AUTOSTART_MONITORING_DEFAULT", False))
+        return bool(settings.get("autostart_monitoring", default))
+
+    @staticmethod
+    def _is_started_from_autostart_service() -> bool:
+        marker = str(os.environ.get("TUXGUARD_AUTOSTART", "") or "").strip().lower()
+        return marker in {"1", "true", "yes"}
+
     def _is_autostart_enabled(self):
         import os
         service_path = self._get_systemd_user_service_path()
         return os.path.exists(service_path)
 
     def _on_autostart_checkbox(self, enabled: bool):
+        self._on_autostart_preferences_changed(
+            bool(enabled),
+            self._load_autostart_monitoring_preference(),
+        )
+
+    def _on_autostart_preferences_changed(self, enabled: bool, start_monitoring: bool):
+        self._save_runtime_settings({"autostart_monitoring": bool(start_monitoring)})
         if enabled:
-            self._enable_autostart_service()
+            self._enable_autostart_service(start_monitoring=bool(start_monitoring))
         else:
             self._disable_autostart_service()
+        self.logger.info(
+            "Autostart aktualisiert: enabled=%s start_monitoring=%s",
+            bool(enabled), bool(start_monitoring),
+        )
 
-    def _enable_autostart_service(self):
+    def _on_system_login_preferences_changed(
+        self,
+        enabled: bool,
+        mode: str,
+        face_tolerance: str,
+        max_attempts: str,
+        lockout_seconds: str,
+    ) -> None:
+        try:
+            tolerance = float(face_tolerance)
+            max_attempts_int = max(1, int(max_attempts))
+            lockout_int = max(1, int(lockout_seconds))
+        except ValueError:
+            self.logger.warning("Ungültige System-Login-Einstellungen ignoriert")
+            return
+
+        self._save_runtime_settings({
+            "system_login_enabled": bool(enabled),
+            "system_login_mode": str(mode),
+            "system_login_face_tolerance": tolerance,
+            "system_login_max_attempts": max_attempts_int,
+            "system_login_lockout_seconds": lockout_int,
+        })
+        self.logger.info(
+            "System-Login-Einstellungen gespeichert: enabled=%s mode=%s tolerance=%.2f max_attempts=%s lockout=%s",
+            bool(enabled),
+            str(mode),
+            tolerance,
+            max_attempts_int,
+            lockout_int,
+        )
+
+    @staticmethod
+    def _systemctl_user(*args: str) -> None:
+        try:
+            subprocess.run(
+                ["systemctl", "--user", *args],
+                check=False,
+                capture_output=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def _enable_autostart_service(self, start_monitoring: bool):
         import os, getpass
         service_path = self._get_systemd_user_service_path()
         os.makedirs(os.path.dirname(service_path), exist_ok=True)
-        exec_path = os.path.abspath(__file__)
+        script_path = os.path.abspath(__file__)
+        python_path = sys.executable or "python3"
         user = getpass.getuser()
-        service_content = f"""[Unit]\nDescription=TuxGuard Security Service\nAfter=graphical-session.target network.target\n\n[Service]\nType=simple\nExecStart={exec_path}\nRestart=on-failure\nUser={user}\n\n[Install]\nWantedBy=default.target\n"""
+        monitor_env = "1" if start_monitoring else "0"
+        exec_start = f"{shlex.quote(python_path)} {shlex.quote(script_path)}"
+        service_content = (
+            "[Unit]\n"
+            "Description=TuxGuard Security Service\n"
+            "After=graphical-session.target network.target\n\n"
+            "[Service]\n"
+            "Type=simple\n"
+            "Environment=TUXGUARD_AUTOSTART=1\n"
+            f"Environment=TUXGUARD_AUTOSTART_MONITORING={monitor_env}\n"
+            f"ExecStart={exec_start}\n"
+            "Restart=on-failure\n"
+            f"User={user}\n\n"
+            "[Install]\n"
+            "WantedBy=default.target\n"
+        )
         with open(service_path, 'w') as f:
             f.write(service_content)
         # Enable the service
-        os.system('systemctl --user daemon-reload')
-        os.system('systemctl --user enable --now tuxguard.service')
+        self._systemctl_user("daemon-reload")
+        self._systemctl_user("enable", "--now", "tuxguard.service")
         self.logger.info("Autostart als Systemdienst aktiviert.")
 
     def _disable_autostart_service(self):
         import os
         service_path = self._get_systemd_user_service_path()
         if os.path.exists(service_path):
-            os.system('systemctl --user disable --now tuxguard.service')
+            self._systemctl_user("disable", "--now", "tuxguard.service")
             os.remove(service_path)
-            os.system('systemctl --user daemon-reload')
+            self._systemctl_user("daemon-reload")
             self.logger.info("Autostart als Systemdienst deaktiviert.")
     
     def _initialize_components(self):

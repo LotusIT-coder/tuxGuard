@@ -41,18 +41,25 @@ echo "Aktualisiere pip und setuptools..."
 
 # Installiere Python-Pakete im Virtual Environment
 echo "Installiere Python-Pakete im Virtual Environment..."
-/opt/tuxguard/.venv/bin/python -m pip install opencv-python numpy pillow pystray psutil pynput tensorflow
+/opt/tuxguard/.venv/bin/python -m pip install -r requirements.txt
 
 # Kopiere alle Programmdateien (nicht nur das Hauptskript)
 echo "Kopiere Programmdateien..."
 install -m 755 tuxguard_refactored.py /opt/tuxguard/tuxguard.py
 install -m 644 *.py /opt/tuxguard/ 2>/dev/null || true
+install -m 644 requirements.txt /opt/tuxguard/
 install -m 644 tux_256.png /opt/tuxguard/
 install -m 644 *.db /opt/tuxguard/ 2>/dev/null || true
 
 # Kopiere models und ihre Inhalte
 if [ -d "models" ]; then
     cp -r models/* /opt/tuxguard/models/ 2>/dev/null || true
+fi
+
+# Kopiere optionale System-Login-Deploy-Templates (PAM/Systemd)
+if [ -d "deploy/system-login" ]; then
+    install -d /opt/tuxguard/deploy/system-login
+    cp -r deploy/system-login/* /opt/tuxguard/deploy/system-login/ 2>/dev/null || true
 fi
 
 # Erstelle Launcher-Wrapper

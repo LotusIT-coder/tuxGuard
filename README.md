@@ -70,7 +70,14 @@ sudo bash install.sh
 Starten:
 
 ```bash
-tuxguard
+./run_tuxguard.sh
+```
+
+oder direkt aus dem Projektordner:
+
+```bash
+cd "TuxGuard(1.0.0)"
+../.venv/bin/python tuxguard_refactored.py
 ```
 
 ## Update einer bestehenden Installation

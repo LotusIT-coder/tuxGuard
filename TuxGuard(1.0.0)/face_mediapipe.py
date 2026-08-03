@@ -1019,21 +1019,25 @@ def face_emotions(
     return emotions
 
 
-def safe_face_encodings_from_file(file_path: str, timeout: int = 30) -> List[np.ndarray]:
-    """Liest Gesichtskodierungen in einem separaten Prozess aus einer Bilddatei."""
+def _run_worker(file_path: str, extra_args: List[str], timeout: int, task_label: str) -> Dict[str, object]:
+    """Führt den Worker-Prozess aus und liefert das JSON-Payload.
+
+    Gemeinsame Basis für Kodierung, Analyse und Enrollment (identisches
+    Subprozess-, Fehler- und Parsing-Verhalten).
+    """
     if not _WORKER_SCRIPT.exists():
         raise FileNotFoundError(f"Worker-Skript nicht gefunden: {_WORKER_SCRIPT}")
 
     try:
         result = subprocess.run(
-            [sys.executable, str(_WORKER_SCRIPT), file_path],
+            [sys.executable, str(_WORKER_SCRIPT), file_path, *extra_args],
             capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("Gesichtserkennung hat das Zeitlimit überschritten.") from exc
+        raise RuntimeError(f"{task_label} hat das Zeitlimit überschritten.") from exc
 
     stdout = (result.stdout or "").strip()
     stderr = (result.stderr or "").strip()
@@ -1048,52 +1052,23 @@ def safe_face_encodings_from_file(file_path: str, timeout: int = 30) -> List[np.
                 details = stdout.splitlines()[-1]
         elif stderr:
             details = stderr.splitlines()[-1]
-        raise RuntimeError(f"Gesichtserkennung fehlgeschlagen: {details}")
+        raise RuntimeError(f"{task_label} fehlgeschlagen: {details}")
 
     try:
-        payload = json.loads(stdout)
+        return json.loads(stdout)
     except json.JSONDecodeError as exc:
-        raise RuntimeError("Ungültige Antwort vom Gesichtserkennungs-Worker.") from exc
+        raise RuntimeError(f"Ungültige Antwort vom Worker ({task_label}).") from exc
 
+
+def safe_face_encodings_from_file(file_path: str, timeout: int = 30) -> List[np.ndarray]:
+    """Liest Gesichtskodierungen in einem separaten Prozess aus einer Bilddatei."""
+    payload = _run_worker(file_path, [], timeout, "Gesichtserkennung")
     return [np.array(encoding, dtype=np.float64) for encoding in payload.get("encodings", [])]
 
 
 def safe_face_analysis_from_file(file_path: str, timeout: int = 30) -> Dict[str, object]:
     """Liefert Gesichtskodierungen plus optionale Emotionsschätzung aus Worker."""
-    if not _WORKER_SCRIPT.exists():
-        raise FileNotFoundError(f"Worker-Skript nicht gefunden: {_WORKER_SCRIPT}")
-
-    try:
-        result = subprocess.run(
-            [sys.executable, str(_WORKER_SCRIPT), file_path, "--with-emotions"],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("Gesichtsanalyse hat das Zeitlimit überschritten.") from exc
-
-    stdout = (result.stdout or "").strip()
-    stderr = (result.stderr or "").strip()
-
-    if result.returncode != 0:
-        details = f"Worker beendet mit Code {result.returncode}"
-        if stdout:
-            try:
-                payload = json.loads(stdout)
-                details = payload.get("error", details)
-            except json.JSONDecodeError:
-                details = stdout.splitlines()[-1]
-        elif stderr:
-            details = stderr.splitlines()[-1]
-        raise RuntimeError(f"Gesichtsanalyse fehlgeschlagen: {details}")
-
-    try:
-        payload = json.loads(stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Ungültige Antwort vom Gesichtsanalyse-Worker.") from exc
-
+    payload = _run_worker(file_path, ["--with-emotions"], timeout, "Gesichtsanalyse")
     return {
         "encodings": [np.array(encoding, dtype=np.float64) for encoding in payload.get("encodings", [])],
         "emotions": payload.get("emotions", []),
@@ -1106,40 +1081,7 @@ def safe_face_enrollment_from_file(file_path: str, timeout: int = 45) -> Dict[st
     Wird beim Hinzufügen von Trainingsbildern genutzt, um zusätzlich zur
     1280-D Kodierung das 3D-Referenzmodell des Nutzers aufzubauen.
     """
-    if not _WORKER_SCRIPT.exists():
-        raise FileNotFoundError(f"Worker-Skript nicht gefunden: {_WORKER_SCRIPT}")
-
-    try:
-        result = subprocess.run(
-            [sys.executable, str(_WORKER_SCRIPT), file_path, "--with-geometry"],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("Gesichtserfassung hat das Zeitlimit überschritten.") from exc
-
-    stdout = (result.stdout or "").strip()
-    stderr = (result.stderr or "").strip()
-
-    if result.returncode != 0:
-        details = f"Worker beendet mit Code {result.returncode}"
-        if stdout:
-            try:
-                payload = json.loads(stdout)
-                details = payload.get("error", details)
-            except json.JSONDecodeError:
-                details = stdout.splitlines()[-1]
-        elif stderr:
-            details = stderr.splitlines()[-1]
-        raise RuntimeError(f"Gesichtserfassung fehlgeschlagen: {details}")
-
-    try:
-        payload = json.loads(stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Ungültige Antwort vom Gesichtserfassungs-Worker.") from exc
-
+    payload = _run_worker(file_path, ["--with-geometry"], timeout, "Gesichtserfassung")
     return {
         "encodings": [
             np.array(encoding, dtype=np.float64)
