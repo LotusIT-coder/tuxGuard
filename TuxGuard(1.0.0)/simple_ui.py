@@ -99,92 +99,6 @@ class ScrollFrame(Frame):
         elif num == 4 or delta > 0:
             self.canvas.yview_scroll(-3, "units")
 
-class SimplePinDialog:
-    """Vereinfachter PIN-Dialog"""
-    
-    def __init__(self, parent: tk.Tk, title: str = "Sicherheitsprüfung", 
-                 reason: str = "Bitte geben Sie Ihre PIN ein"):
-        self.parent = parent
-        self.title = title
-        self.reason = reason
-        self.result: Optional[str] = None
-        self.dialog: Optional[tk.Toplevel] = None
-    
-    def show(self) -> Optional[str]:
-        """Zeigt den PIN-Dialog"""
-        self.dialog = tk.Toplevel(self.parent)
-        self.dialog.title(self.title)
-        self.dialog.geometry("420x280")
-        self.dialog.configure(bg=ModernColors.SURFACE)
-        self.dialog.transient(self.parent)
-        
-        # Zentrieren
-        sw, sh = self.dialog.winfo_screenwidth(), self.dialog.winfo_screenheight()
-        x = (sw - 420) // 2
-        y = (sh - 280) // 2
-        self.dialog.geometry(f"420x280+{x}+{y}")
-        
-        self.dialog.attributes('-topmost', True)
-        self.dialog.focus_force()
-        # Wenn das Parent-Fenster bereits einen Grab hält (Sperr-Overlay),
-        # darf hier kein zweiter Grab gesetzt werden.
-        if self.parent.grab_current() is None:
-            self.dialog.grab_set()
-        self.dialog.protocol("WM_DELETE_WINDOW", self._cancel)
-        self.dialog.minsize(380, 250)
-        self.dialog.resizable(True, True)
-
-        content = Frame(self.dialog, bg=ModernColors.SURFACE)
-        content.pack(fill=tk.BOTH, expand=True, padx=14, pady=12)
-
-        # Icon und Titel
-        Label(content, text="🔒", font=("Arial", 32),
-              bg=ModernColors.SURFACE, fg=ModernColors.PRIMARY).pack(pady=(4, 2))
-
-        Label(content, text=self.title, font=("Arial", 14, "bold"),
-              bg=ModernColors.SURFACE, fg=ModernColors.TEXT_PRIMARY).pack()
-
-        Label(content, text=self.reason, font=("Arial", 9),
-              bg=ModernColors.SURFACE, fg=ModernColors.TEXT_SECONDARY,
-              wraplength=360, justify="center").pack(pady=8)
-        
-        # PIN-Eingabe
-        self.pin_entry = Entry(content, show='●', font=("Arial", 12),
-                              bg=ModernColors.BACKGROUND, justify='center', bd=2)
-        self.pin_entry.pack(pady=8, padx=18, fill=tk.X)
-        self.pin_entry.focus_set()
-        
-        # Buttons
-        button_frame = Frame(content, bg=ModernColors.SURFACE)
-        button_frame.pack(side=tk.BOTTOM, pady=(10, 2))
-        
-        Button(button_frame, text="✓ OK", command=self._ok,
-               bg=ModernColors.SUCCESS, fg=ModernColors.TEXT_ON_PRIMARY,
-               font=("Arial", 10, "bold"), padx=20, pady=5, bd=0).pack(side=tk.LEFT, padx=5)
-        
-        Button(button_frame, text="✕ Abbrechen", command=self._cancel,
-               bg=ModernColors.ERROR, fg=ModernColors.TEXT_ON_PRIMARY,
-               font=("Arial", 10, "bold"), padx=20, pady=5, bd=0).pack(side=tk.LEFT, padx=5)
-        
-        self.pin_entry.bind('<Return>', lambda e: self._ok())
-        self.pin_entry.bind('<Escape>', lambda e: self._cancel())
-        
-        self.parent.wait_window(self.dialog)
-        return self.result
-    
-    def _ok(self):
-        self.result = self.pin_entry.get()
-        self.pin_entry.delete(0, tk.END)
-        if self.dialog:
-            self.dialog.destroy()
-    
-    def _cancel(self):
-        self.result = None
-        if hasattr(self, 'pin_entry'):
-            self.pin_entry.delete(0, tk.END)
-        if self.dialog:
-            self.dialog.destroy()
-
 class SimpleUserListWidget:
     """Vereinfachtes Benutzer-Listen-Widget"""
     
@@ -395,6 +309,13 @@ class SimpleMainUI:
         self.monitor_preview_image = None
         self.monitor_preview_status_label: Optional[Label] = None
         self.autostart_callback: Optional[Callable] = None
+        self.autostart_preferences_callback: Optional[Callable] = None
+        self.system_login_callback: Optional[Callable] = None
+        self.system_login_enabled_var: Optional[tk.BooleanVar] = None
+        self.system_login_mode_var: Optional[tk.StringVar] = None
+        self.system_login_face_tolerance_var: Optional[tk.StringVar] = None
+        self.system_login_max_attempts_var: Optional[tk.StringVar] = None
+        self.system_login_lockout_var: Optional[tk.StringVar] = None
         
         self._setup_window()
         self._create_widgets()
@@ -478,21 +399,7 @@ class SimpleMainUI:
         self.notebook.add(scroll_frame, text="🖥️ Überwachung")
         frame = scroll_frame.content_frame
 
-        # Autostart-Checkbox oben platzieren
-        autostart_frame = Frame(frame, bg=ModernColors.SURFACE, relief=tk.RIDGE, bd=2)
-        autostart_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
-        self.autostart_var = tk.BooleanVar(value=False)
-        autostart_cb = tk.Checkbutton(
-            autostart_frame,
-            text="TuxGuard beim Systemstart automatisch als Dienst starten",
-            variable=self.autostart_var,
-            command=self._on_autostart_changed,
-            bg=ModernColors.SURFACE,
-            fg=ModernColors.TEXT_PRIMARY,
-            selectcolor=ModernColors.SECONDARY_LIGHT,
-            font=("Arial", 10)
-        )
-        autostart_cb.pack(anchor="w", padx=10, pady=5)
+        self._create_optional_settings_section(frame)
 
         # Kamera-Kontrollen
         self._create_control_section(frame, "Kamera-Überwachung", [
@@ -513,12 +420,26 @@ class SimpleMainUI:
         self.security_log_widget = SimpleLogWidget(frame, "🔐 Sicherheitsereignisse")
 
     def _on_autostart_changed(self):
+        if hasattr(self, 'autostart_preferences_callback') and callable(self.autostart_preferences_callback):
+            self.autostart_preferences_callback(
+                self.autostart_var.get(),
+                self.autostart_monitoring_var.get(),
+            )
+            return
         if hasattr(self, 'autostart_callback') and callable(self.autostart_callback):
             self.autostart_callback(self.autostart_var.get())
 
     def set_autostart_state(self, enabled: bool):
+        self.set_autostart_settings(
+            enabled,
+            bool(getattr(Config, "AUTOSTART_MONITORING_DEFAULT", False))
+        )
+
+    def set_autostart_settings(self, enabled: bool, start_monitoring: bool):
         if hasattr(self, 'autostart_var'):
             self.autostart_var.set(enabled)
+        if hasattr(self, 'autostart_monitoring_var'):
+            self.autostart_monitoring_var.set(start_monitoring)
 
     def set_security_settings(self, mode: str, deadman_timeout: int, deadman_action: str):
         if self.security_mode_var is not None:
@@ -560,6 +481,124 @@ class SimpleMainUI:
             self.keystroke_enrollment_var.set(str(int(settings["min_enrollment_keystrokes"])))
         self._update_keystroke_settings_visibility()
         self._set_keystroke_settings_dirty(False)
+
+    def _create_optional_settings_section(self, parent):
+        container = Frame(parent, bg=ModernColors.SURFACE, relief=tk.RIDGE, bd=2)
+        container.pack(fill=tk.X, padx=10, pady=(10, 5))
+
+        Label(
+            container,
+            text="⚙️ Optionale Funktionen",
+            font=("Arial", 10, "bold"),
+            bg=ModernColors.SURFACE,
+            fg=ModernColors.TEXT_PRIMARY,
+        ).pack(anchor="w", padx=10, pady=(8, 6))
+
+        Label(
+            container,
+            text="Autostart und optionaler System-Login lassen sich hier direkt aktivieren und konfigurieren.",
+            font=("Arial", 8),
+            bg=ModernColors.SURFACE,
+            fg=ModernColors.TEXT_SECONDARY,
+            justify="left",
+            wraplength=560,
+        ).pack(anchor="w", padx=10, pady=(0, 8))
+
+        self.autostart_var = tk.BooleanVar(value=False)
+        autostart_cb = tk.Checkbutton(
+            container,
+            text="TuxGuard beim Systemstart automatisch als Dienst starten",
+            variable=self.autostart_var,
+            command=self._on_autostart_changed,
+            bg=ModernColors.SURFACE,
+            fg=ModernColors.TEXT_PRIMARY,
+            selectcolor=ModernColors.SECONDARY_LIGHT,
+            font=("Arial", 10),
+        )
+        autostart_cb.pack(anchor="w", padx=10, pady=2)
+
+        self.autostart_monitoring_var = tk.BooleanVar(
+            value=getattr(Config, "AUTOSTART_MONITORING_DEFAULT", False)
+        )
+        autostart_monitoring_cb = tk.Checkbutton(
+            container,
+            text="Bei Autostart die Überwachung direkt aktivieren",
+            variable=self.autostart_monitoring_var,
+            command=self._on_autostart_changed,
+            bg=ModernColors.SURFACE,
+            fg=ModernColors.TEXT_PRIMARY,
+            selectcolor=ModernColors.SECONDARY_LIGHT,
+            font=("Arial", 10),
+        )
+        autostart_monitoring_cb.pack(anchor="w", padx=10, pady=2)
+
+        ttk.Separator(container, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=10, pady=(8, 8))
+
+        self.system_login_enabled_var = tk.BooleanVar(value=False)
+        system_login_cb = tk.Checkbutton(
+            container,
+            text="Optionalen System-Login über Gesicht/PIN aktivieren",
+            variable=self.system_login_enabled_var,
+            command=self._on_optional_settings_changed,
+            bg=ModernColors.SURFACE,
+            fg=ModernColors.TEXT_PRIMARY,
+            selectcolor=ModernColors.SECONDARY_LIGHT,
+            font=("Arial", 10),
+        )
+        system_login_cb.pack(anchor="w", padx=10, pady=2)
+
+        mode_row = Frame(container, bg=ModernColors.SURFACE)
+        mode_row.pack(fill=tk.X, padx=10, pady=4)
+        Label(mode_row, text="Login-Modus:", bg=ModernColors.SURFACE).pack(side=tk.LEFT)
+        self.system_login_mode_var = tk.StringVar(value="face_or_password")
+        mode_box = ttk.Combobox(
+            mode_row,
+            textvariable=self.system_login_mode_var,
+            state="readonly",
+            values=["face_or_password", "face_and_pin", "password_only"],
+            width=18,
+        )
+        mode_box.pack(side=tk.LEFT, padx=10)
+        mode_box.bind("<<ComboboxSelected>>", lambda _e: self._on_optional_settings_changed())
+
+        tolerance_row = Frame(container, bg=ModernColors.SURFACE)
+        tolerance_row.pack(fill=tk.X, padx=10, pady=4)
+        Label(tolerance_row, text="Face-Toleranz:", bg=ModernColors.SURFACE).pack(side=tk.LEFT)
+        self.system_login_face_tolerance_var = tk.StringVar(value="0.9")
+        tolerance_entry = tk.Entry(tolerance_row, textvariable=self.system_login_face_tolerance_var, width=8)
+        tolerance_entry.pack(side=tk.LEFT, padx=10)
+        tolerance_entry.bind("<FocusOut>", lambda _e: self._on_optional_settings_changed())
+
+        attempts_row = Frame(container, bg=ModernColors.SURFACE)
+        attempts_row.pack(fill=tk.X, padx=10, pady=4)
+        Label(attempts_row, text="Versuche/Window:", bg=ModernColors.SURFACE).pack(side=tk.LEFT)
+        self.system_login_max_attempts_var = tk.StringVar(value="5")
+        attempts_entry = tk.Entry(attempts_row, textvariable=self.system_login_max_attempts_var, width=6)
+        attempts_entry.pack(side=tk.LEFT, padx=10)
+        attempts_entry.bind("<FocusOut>", lambda _e: self._on_optional_settings_changed())
+
+        lockout_row = Frame(container, bg=ModernColors.SURFACE)
+        lockout_row.pack(fill=tk.X, padx=10, pady=(4, 10))
+        Label(lockout_row, text="Sperrzeit (s):", bg=ModernColors.SURFACE).pack(side=tk.LEFT)
+        self.system_login_lockout_var = tk.StringVar(value="120")
+        lockout_entry = tk.Entry(lockout_row, textvariable=self.system_login_lockout_var, width=8)
+        lockout_entry.pack(side=tk.LEFT, padx=10)
+        lockout_entry.bind("<FocusOut>", lambda _e: self._on_optional_settings_changed())
+
+    def _on_optional_settings_changed(self):
+        if hasattr(self, 'autostart_preferences_callback') and callable(self.autostart_preferences_callback):
+            self.autostart_preferences_callback(
+                self.autostart_var.get(),
+                self.autostart_monitoring_var.get(),
+            )
+        if hasattr(self, 'system_login_callback') and callable(self.system_login_callback):
+            self.system_login_callback(
+                self.system_login_enabled_var.get() if self.system_login_enabled_var else False,
+                self.system_login_mode_var.get() if self.system_login_mode_var else "face_or_password",
+                self.system_login_face_tolerance_var.get() if self.system_login_face_tolerance_var else "0.9",
+                self.system_login_max_attempts_var.get() if self.system_login_max_attempts_var else "5",
+                self.system_login_lockout_var.get() if self.system_login_lockout_var else "120",
+            )
 
     def _create_control_section(self, parent, title, buttons):
         container = Frame(parent, bg=ModernColors.SURFACE, relief=tk.RIDGE, bd=2)
@@ -938,18 +977,36 @@ class SimpleMainUI:
 
     def collect_keystroke_settings(self) -> dict:
         """Sammelt die aktuellen Keystroke-Eingaben aus der UI."""
+        enabled_var = self.keystroke_enabled_var
+        global_var = self.keystroke_global_var
+        adaptive_var = self.keystroke_adaptive_var
+        fusion_var = self.keystroke_fusion_var
+        primary_var = self.keystroke_primary_var
+        face_lost_var = self.keystroke_on_face_lost_var
+        intruder_var = self.keystroke_on_intruder_var
+        keystroke_lost_var = self.keystroke_on_ks_lost_var
+        threshold_var = self.keystroke_threshold_var
+        intruder_confidence_var = self.keystroke_intruder_confidence_var
+        enrollment_var = self.keystroke_enrollment_var
+        if (
+            enabled_var is None or global_var is None or adaptive_var is None
+            or fusion_var is None or primary_var is None or face_lost_var is None
+            or intruder_var is None or keystroke_lost_var is None or threshold_var is None
+            or intruder_confidence_var is None or enrollment_var is None
+        ):
+            return {}
         return {
-            "enabled": bool(self.keystroke_enabled_var.get()),
-            "global_capture": bool(self.keystroke_global_var.get()),
-            "adaptive_learning": bool(self.keystroke_adaptive_var.get()),
-            "fusion_mode": self.keystroke_fusion_var.get(),
-            "primary_factor": self.keystroke_primary_var.get(),
-            "on_face_lost": self.keystroke_on_face_lost_var.get(),
-            "on_keystroke_intruder": self.keystroke_on_intruder_var.get(),
-            "on_keystroke_lost": self.keystroke_on_ks_lost_var.get(),
-            "match_threshold": self.keystroke_threshold_var.get(),
-            "intruder_confidence_threshold": self.keystroke_intruder_confidence_var.get(),
-            "min_enrollment_keystrokes": self.keystroke_enrollment_var.get(),
+            "enabled": bool(enabled_var.get()),
+            "global_capture": bool(global_var.get()),
+            "adaptive_learning": bool(adaptive_var.get()),
+            "fusion_mode": fusion_var.get(),
+            "primary_factor": primary_var.get(),
+            "on_face_lost": face_lost_var.get(),
+            "on_keystroke_intruder": intruder_var.get(),
+            "on_keystroke_lost": keystroke_lost_var.get(),
+            "match_threshold": threshold_var.get(),
+            "intruder_confidence_threshold": intruder_confidence_var.get(),
+            "min_enrollment_keystrokes": enrollment_var.get(),
         }
 
     def _create_monitor_preview_section(self, parent):
@@ -1310,7 +1367,6 @@ class KeystrokeEnrollmentDialog:
 
 
 # Export für Kompatibilität
-PinDialog = SimplePinDialog
 UserListWidget = SimpleUserListWidget
 LogWidget = SimpleLogWidget
 StatusWidget = None  # Wird nicht mehr separat benötigt
@@ -1335,19 +1391,19 @@ class PasswordDialog:
         self.allow_cancel = allow_cancel
         self.result: Optional[str] = None
         self.dialog: Optional[tk.Toplevel] = None
+        self._previous_grab = None
 
     def show(self) -> Optional[str]:
         self.dialog = tk.Toplevel(self.parent)
         self.dialog.title(self.title)
         self.dialog.geometry("380x240")
         self.dialog.configure(bg=ModernColors.SURFACE)
+        self.dialog.transient(self.parent)
         sw, sh = self.dialog.winfo_screenwidth(), self.dialog.winfo_screenheight()
         x = (sw - 380) // 2
         y = (sh - 240) // 2
         self.dialog.geometry(f"380x240+{x}+{y}")
         self.dialog.attributes("-topmost", True)
-        self.dialog.focus_force()
-        self.dialog.grab_set()
         self.dialog.protocol(
             "WM_DELETE_WINDOW",
             self._cancel if self.allow_cancel else (lambda: None),
@@ -1368,7 +1424,6 @@ class PasswordDialog:
         self.password_entry = Entry(self.dialog, show="●", font=("Arial", 12),
                                     bg=ModernColors.BACKGROUND, justify="center", bd=2)
         self.password_entry.pack(padx=30, fill=tk.X)
-        self.password_entry.focus_set()
 
         button_frame = Frame(self.dialog, bg=ModernColors.SURFACE)
         button_frame.pack(pady=14)
@@ -1385,8 +1440,46 @@ class PasswordDialog:
         if self.allow_cancel:
             self.password_entry.bind("<Escape>", lambda _e: self._cancel())
 
+        self._activate_modal_dialog()
+        self.password_entry.focus_set()
+
         self.parent.wait_window(self.dialog)
+        self._restore_previous_grab()
         return self.result
+
+    def _activate_modal_dialog(self):
+        """Macht den Dialog sichtbar, bevor er den Eingabe-Grab übernimmt."""
+        if self.dialog is None:
+            return
+        self.dialog.deiconify()
+        self.dialog.update_idletasks()
+        self.dialog.lift(self.parent)
+        self.dialog.attributes("-topmost", True)
+        self.dialog.focus_force()
+        self._previous_grab = self.parent.grab_current()
+        try:
+            if self._previous_grab is not None:
+                self._previous_grab.grab_release()
+            self.dialog.grab_set()
+        except tk.TclError:
+            self._restore_previous_grab()
+            try:
+                self.dialog.destroy()
+            except tk.TclError:
+                pass
+            raise
+
+    def _restore_previous_grab(self):
+        previous_grab = self._previous_grab
+        self._previous_grab = None
+        if previous_grab is None:
+            return
+        try:
+            if previous_grab.winfo_exists():
+                previous_grab.grab_set()
+                previous_grab.focus_force()
+        except tk.TclError:
+            pass
 
     def _ok(self):
         self.result = self.password_entry.get()

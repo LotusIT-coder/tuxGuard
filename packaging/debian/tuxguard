@@ -1,0 +1,17 @@
+#!/usr/bin/env sh
+set -eu
+
+APP_DIR="/opt/tuxguard"
+PYTHON="$APP_DIR/.venv/bin/python"
+
+if [ ! -x "$PYTHON" ]; then
+    printf '%s\n' "TuxGuard runtime is incomplete: $PYTHON is missing." >&2
+    exit 1
+fi
+
+export PYTHONNOUSERSITE=1
+export MEDIAPIPE_DISABLE_GPU=1
+export TF_CPP_MIN_LOG_LEVEL=2
+
+cd "$APP_DIR"
+exec "$PYTHON" "$APP_DIR/tuxguard_refactored.py" "$@"

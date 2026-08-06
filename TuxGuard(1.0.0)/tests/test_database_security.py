@@ -51,6 +51,14 @@ def test_verify_user_pin_for_user_is_user_specific(db_manager):
     assert db_manager.verify_user_pin_for_user("bob", "222222") is True
 
 
+def test_verify_user_pin_accepts_the_pin_of_any_registered_user(db_manager):
+    db_manager.add_user("alice", "111111", password="Password123", is_admin=False)
+    db_manager.add_user("bob", "222222", password="Password456", is_admin=False)
+
+    assert db_manager.verify_user_pin("222222") is True
+    assert db_manager.verify_user_pin("999999") is False
+
+
 def test_verify_user_pin_upgrades_legacy_hash_to_pbkdf2(db_manager):
     legacy = hashlib.sha256("123456".encode("utf-8")).hexdigest()
     db_manager.cursor.execute(

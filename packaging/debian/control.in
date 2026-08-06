@@ -1,0 +1,14 @@
+Package: tuxguard
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: @ARCHITECTURE@
+Maintainer: TuxGuard Maintainers <maintainers@tuxguard.local>
+Depends: python3.12, python3-tk, i3lock, v4l-utils, lsof, libegl1, libgl1, libglib2.0-0, libgomp1, libsm6, libx11-6, libxext6, libxi6, libxrender1, libxtst6
+Recommends: xdg-utils
+Description: Local desktop security application with face recognition
+ TuxGuard provides local face recognition, PIN/password gates and
+ continuous desktop monitoring. Python runtime dependencies are bundled
+ in this package, so installation does not invoke pip or require network
+ access beyond resolving the declared system dependencies.
+ .

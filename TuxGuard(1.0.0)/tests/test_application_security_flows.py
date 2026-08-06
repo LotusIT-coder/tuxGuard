@@ -20,7 +20,6 @@ def _install_import_stubs():
             return None
 
     simple_ui_stub.MainUI = object
-    simple_ui_stub.PinDialog = _Dialog
     simple_ui_stub.PasswordDialog = _Dialog
     simple_ui_stub.LoginDialog = _Dialog
     simple_ui_stub.FirstRunWizard = _Dialog
@@ -175,6 +174,35 @@ class DummyLabel(DummyContainer):
         self.config_calls.append(kwargs)
 
 
+class DummyButton(DummyContainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.command = kwargs.get("command")
+
+
+class DummyEntry(DummyContainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.value = ""
+        self.bindings = {}
+        self.focused = False
+
+    def bind(self, sequence, callback):
+        self.bindings[sequence] = callback
+
+    def get(self):
+        return self.value
+
+    def delete(self, _start, _end):
+        self.value = ""
+
+    def focus_set(self):
+        self.focused = True
+
+    def winfo_toplevel(self):
+        return None
+
+
 @pytest.fixture
 def app():
     app = object.__new__(TuxGuardApplication)
@@ -189,6 +217,7 @@ def app():
     app.ui = types.SimpleNamespace(
         add_security_log=Mock(),
         update_monitoring_button=Mock(),
+        update_monitor_preview=Mock(),
         clear_monitor_preview=Mock(),
         set_ui_behavior=Mock(),
     )
@@ -202,8 +231,12 @@ def app():
     app.security_lock_active = False
     app.security_lock_window = None
     app.security_lock_status_label = None
+    app.security_lock_status_labels = []
+    app.security_lock_pin_entries = []
+    app.security_lock_recognized_user = None
+    app.security_lock_camera_status = ""
+    app.security_lock_camera_status_level = "INFO"
     app.security_lock_unlock_pending = False
-    app.strict_unlock_prompt_active = False
     app.force_admin_unlock_required = False
     app.deadman_triggered = False
     app.last_authorized_seen_at = 0.0
@@ -283,6 +316,22 @@ def test_on_ui_behavior_changed_updates_state_when_authorized(app):
 
     assert app.minimize_behavior == "normal"
     assert app.close_behavior == "quit"
+
+
+def test_security_settings_are_saved_when_authorized(app):
+    app._require_admin_password = Mock(return_value=True)
+    app._save_runtime_settings = Mock()
+
+    app._on_security_settings_changed("self_unlock", "45", "shutdown")
+
+    assert app.security_mode == "self_unlock"
+    assert app.deadman_timeout_seconds == 45
+    assert app.deadman_action == "shutdown"
+    app._save_runtime_settings.assert_called_once_with({
+        "security_mode": "self_unlock",
+        "deadman_timeout_seconds": 45,
+        "deadman_action": "shutdown",
+    })
 
 
 def test_add_additional_admin_password_happy_path(monkeypatch, app):
@@ -378,10 +427,30 @@ def test_prompt_lock_unlock_uses_admin_password(monkeypatch, app):
     assert app.deadman_triggered is False
 
 
+def test_prompt_lock_unlock_handles_tk_dialog_error(monkeypatch, app):
+    class Dialog:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def show(self):
+            raise app_module.tk.TclError("window not viewable")
+
+    app.security_lock_active = True
+    monkeypatch.setattr(app_module, "PasswordDialog", Dialog)
+
+    app._prompt_lock_unlock()
+
+    app.master_auth.verify_admin_password.assert_not_called()
+    assert app.security_lock_unlock_pending is False
+    app.logger.error.assert_called_once()
+
+
 def test_activate_security_lock_creates_one_overlay_per_monitor(monkeypatch, app):
     monkeypatch.setattr(app_module.tk, "Toplevel", DummyLockWindow)
     monkeypatch.setattr(app_module.tk, "Frame", DummyContainer)
     monkeypatch.setattr(app_module.tk, "Label", DummyLabel)
+    monkeypatch.setattr(app_module.tk, "Button", DummyButton)
+    monkeypatch.setattr(app_module.tk, "Entry", DummyEntry)
     app._get_security_lock_geometries = Mock(return_value=[(0, 0, 1920, 1080), (1920, 0, 1920, 1080)])
     app._activate_security_lock = TuxGuardApplication._activate_security_lock.__get__(app, TuxGuardApplication)
     app._update_security_lock_status = TuxGuardApplication._update_security_lock_status.__get__(app, TuxGuardApplication)
@@ -395,13 +464,32 @@ def test_activate_security_lock_creates_one_overlay_per_monitor(monkeypatch, app
     assert all(("-topmost", True) in window.attributes_calls for window in app.security_lock_windows)
     assert all(window.grab_set_called is True for window in app.security_lock_windows)
     assert len(app.security_lock_status_labels) == 2
-    assert all(label.config_calls[-1]["text"].startswith("Warte auf einen legitimen Nutzer.") for label in app.security_lock_status_labels)
+    assert len(app.security_lock_pin_entries) == 2
+    assert all(label.config_calls[-1]["text"].startswith("PIN-Entsperrung aktiv.") for label in app.security_lock_status_labels)
+
+
+def test_activate_security_lock_resets_camera_recognition_state(monkeypatch, app):
+    monkeypatch.setattr(app_module.tk, "Toplevel", DummyLockWindow)
+    monkeypatch.setattr(app_module.tk, "Frame", DummyContainer)
+    monkeypatch.setattr(app_module.tk, "Label", DummyLabel)
+    monkeypatch.setattr(app_module.tk, "Button", DummyButton)
+    monkeypatch.setattr(app_module.tk, "Entry", DummyEntry)
+    app.camera_manager.reset_recognition_state = Mock()
+    app._get_security_lock_geometries = Mock(return_value=[(0, 0, 800, 600)])
+    app._activate_security_lock = TuxGuardApplication._activate_security_lock.__get__(app, TuxGuardApplication)
+    app._update_security_lock_status = TuxGuardApplication._update_security_lock_status.__get__(app, TuxGuardApplication)
+
+    app._activate_security_lock("Recognition reset test")
+
+    app.camera_manager.reset_recognition_state.assert_called_once_with(reset_liveness=True)
 
 
 def test_release_security_lock_destroys_all_overlay_windows(monkeypatch, app):
     monkeypatch.setattr(app_module.tk, "Toplevel", DummyLockWindow)
     monkeypatch.setattr(app_module.tk, "Frame", DummyContainer)
     monkeypatch.setattr(app_module.tk, "Label", DummyLabel)
+    monkeypatch.setattr(app_module.tk, "Button", DummyButton)
+    monkeypatch.setattr(app_module.tk, "Entry", DummyEntry)
     app._get_security_lock_geometries = Mock(return_value=[(0, 0, 800, 600), (800, 0, 800, 600)])
     app._activate_security_lock = TuxGuardApplication._activate_security_lock.__get__(app, TuxGuardApplication)
     app._release_security_lock = TuxGuardApplication._release_security_lock.__get__(app, TuxGuardApplication)
@@ -429,6 +517,137 @@ def test_on_user_seen_self_unlock_skips_auto_release_when_admin_unlock_required(
 
     assert app.deadman_triggered is False
     assert app.root.after_calls == []
+
+
+def test_recognized_user_schedules_self_unlock_after_confirmed_recognition(app):
+    app.security_lock_active = True
+    app.security_mode = "self_unlock"
+    app._fusion_active = Mock(return_value=False)
+
+    app._handle_user_recognized("alice")
+
+    assert len(app.root.after_calls) == 1
+    _, callback = app.root.after_calls[0]
+    callback()
+    app._auto_release_self_unlock.assert_called_once_with("alice")
+
+
+def test_recognized_user_does_not_auto_unlock_when_admin_unlock_is_required(app):
+    app.security_lock_active = True
+    app.security_mode = "self_unlock"
+    app.force_admin_unlock_required = True
+    app._fusion_active = Mock(return_value=False)
+
+    app._handle_user_recognized("alice")
+
+    assert app.root.after_calls == []
+
+
+def test_recognized_user_opens_strict_pin_prompt(app):
+    app.security_lock_active = True
+    app.security_mode = "strict_pin"
+    app._fusion_active = Mock(return_value=False)
+    app._prompt_strict_unlock = Mock()
+
+    app._handle_user_recognized("alice")
+
+    app._prompt_strict_unlock.assert_called_once_with("alice")
+
+
+def test_embedded_pin_unlocks_without_creating_a_dialog(app):
+    entry = DummyEntry()
+    entry.value = "123456"
+    app.security_lock_active = True
+    app.db_manager.verify_user_pin = Mock(return_value=True)
+    app._release_security_lock = Mock()
+
+    assert app._submit_security_lock_pin(entry) is True
+
+    app.db_manager.verify_user_pin.assert_called_once_with("123456")
+    app._release_security_lock.assert_called_once_with(None)
+    assert entry.value == ""
+
+
+def test_recognized_user_binds_embedded_pin_to_that_user(app):
+    entry = DummyEntry()
+    app.security_lock_active = True
+    app.security_lock_pin_entries = [entry]
+    app._security_lock_dialog_parent = Mock(return_value=None)
+
+    app._prompt_strict_unlock("alice")
+
+    assert app.security_lock_recognized_user == "alice"
+    assert entry.focused is True
+
+
+def test_embedded_pin_rejects_invalid_value_and_keeps_lock_active(app):
+    entry = DummyEntry()
+    entry.value = "wrong"
+    app.security_lock_active = True
+    app.security_lock_pin_entries = [entry]
+    app._security_lock_dialog_parent = Mock(return_value=None)
+    app.db_manager.verify_user_pin = Mock(return_value=False)
+    app._release_security_lock = Mock()
+
+    assert app._submit_security_lock_pin(entry) is False
+
+    assert app.security_lock_active is True
+    assert app.security_lock_camera_status == "PIN ungültig. Bitte erneut eingeben."
+    assert entry.focused is True
+    app._release_security_lock.assert_not_called()
+
+
+def test_lock_status_explains_strict_pin_liveness_and_screen_target(app):
+    app.security_mode = "strict_pin"
+    app.lock_target = "screen"
+    app.security_lock_status_labels = [DummyLabel()]
+
+    app._update_security_lock_status()
+
+    text = app.security_lock_status_labels[0].config_calls[-1]["text"]
+    assert text.startswith("PIN-Entsperrung aktiv.")
+    assert "Kamera:" in text
+    assert "Sperrziel: TuxGuard-Overlay." in text
+
+
+def test_camera_preview_status_is_shown_on_active_lock_screen(app):
+    app.security_lock_active = True
+    app.security_lock_status_labels = [DummyLabel()]
+    app._handle_camera_preview_updated = TuxGuardApplication._handle_camera_preview_updated.__get__(app, TuxGuardApplication)
+
+    app._handle_camera_preview_updated(None, "Bitte einmal blinzeln", "WARN")
+
+    text = app.security_lock_status_labels[0].config_calls[-1]["text"]
+    assert "Kamera: Bitte einmal blinzeln" in text
+    assert app.security_lock_status_labels[0].config_calls[-1]["fg"] == "#ffd27f"
+
+
+def test_lock_status_explains_system_lock_limit(app):
+    app.security_lock_status_labels = [DummyLabel()]
+    app.lock_target = "computer"
+
+    app._update_security_lock_status()
+
+    text = app.security_lock_status_labels[0].config_calls[-1]["text"]
+    assert "Sperrziel: System-Sitzung." in text
+    assert "Desktop-Sperrbildschirm" in text
+
+
+def test_manual_strict_pin_focus_does_not_use_a_stale_recognized_user(monkeypatch, app):
+    monkeypatch.setattr(app_module.tk, "Toplevel", DummyLockWindow)
+    monkeypatch.setattr(app_module.tk, "Frame", DummyContainer)
+    monkeypatch.setattr(app_module.tk, "Label", DummyLabel)
+    monkeypatch.setattr(app_module.tk, "Button", DummyButton)
+    monkeypatch.setattr(app_module.tk, "Entry", DummyEntry)
+    app.current_user = "stale-user"
+    app._get_security_lock_geometries = Mock(return_value=[(0, 0, 800, 600)])
+    app._activate_security_lock = TuxGuardApplication._activate_security_lock.__get__(app, TuxGuardApplication)
+    app._update_security_lock_status = TuxGuardApplication._update_security_lock_status.__get__(app, TuxGuardApplication)
+
+    app._activate_security_lock("Manual PIN test")
+    app.security_lock_window.bindings["<Button-1>"](None)
+
+    assert app.security_lock_recognized_user is None
 
 
 @pytest.mark.parametrize(

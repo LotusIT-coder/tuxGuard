@@ -67,6 +67,11 @@ Thumbs.db
 *.temp
 .cache/
 
+# Local release artifacts and runtime preferences
+*.deb
+runtime_settings.json
+**/runtime_settings.json
+
 # TuxGuard - Sicherheitsrelevante Laufzeitdateien (NIE committen!)
 master_credentials.json
 **/master_credentials.json

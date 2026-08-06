@@ -493,24 +493,27 @@ class DatabaseManager:
             logger.error(f"Fehler beim Löschen des Tippmuster-Profils: {e}")
     
     def verify_user_pin(self, pin: str) -> bool:
-        """Verifiziert eine PIN gegen alle Benutzer"""
+        """Verifiziert eine PIN gegen alle registrierten Benutzer."""
         self._ensure_connected()
+        if not pin:
+            return False
         try:
-            self.cursor.execute("SELECT pin_hash FROM users LIMIT 1")
-            row = self.cursor.fetchone()
-            if not row:
-                return False
-            
-            stored_hash = row[0]
-            is_valid = SecurityUtils.verify_pin(pin, stored_hash)
-            
-            # Upgrade legacy hash falls nötig
-            if is_valid and not stored_hash.startswith("pbkdf2_sha256$"):
-                SecurityUtils.upgrade_pin_hash(self.cursor, pin, stored_hash)
-                self.conn.commit()
-                logger.info("PIN-Hash auf PBKDF2 aktualisiert")
-            
-            return is_valid
+            self.cursor.execute("SELECT name, pin_hash FROM users")
+            for user_name, stored_hash in self.cursor.fetchall():
+                if not stored_hash or not SecurityUtils.verify_pin(pin, stored_hash):
+                    continue
+
+                # Upgrade legacy hash falls nötig.
+                if not stored_hash.startswith("pbkdf2_sha256$"):
+                    new_hash = SecurityUtils.hash_pin_pbkdf2(pin)
+                    self.cursor.execute(
+                        "UPDATE users SET pin_hash=? WHERE name=?",
+                        (new_hash, user_name),
+                    )
+                    self.conn.commit()
+                    logger.info("PIN-Hash auf PBKDF2 aktualisiert (Benutzer: %s)", user_name)
+                return True
+            return False
         except Exception as e:
             logger.error(f"Fehler bei PIN-Verifikation: {e}")
             return False

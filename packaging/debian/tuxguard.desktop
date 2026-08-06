@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=TuxGuard
+Comment=Local desktop security monitoring
+Exec=tuxguard
+Icon=/opt/tuxguard/tux_256.png
+StartupWMClass=TuxGuard
+Terminal=false
+Categories=Utility;Security;

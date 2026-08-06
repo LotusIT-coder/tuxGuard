@@ -18,6 +18,13 @@ class Config:
     
     # Ermittle das Installationsverzeichnis (relativ zum Skriptpfad)
     _SCRIPT_DIR = Path(__file__).resolve().parent
+    _PACKAGE_INSTALL_DIR = Path("/opt/tuxguard")
+    _USER_STATE_DIR = Path(
+        os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")
+    ) / "tuxguard"
+    STATE_DIR = (
+        _USER_STATE_DIR if _SCRIPT_DIR == _PACKAGE_INSTALL_DIR else _SCRIPT_DIR
+    )
     
     # Datenbankeinstellungen
     DATABASE_FILE = "face_recognition.db"
@@ -37,9 +44,9 @@ class Config:
     LOCK_TARGET = "screen"
 
     # Master-Credential-Datei (vom Installer angelegt, enthält Master-Passwort + Recovery-Hash)
-    MASTER_CREDENTIALS_FILE = _SCRIPT_DIR / "master_credentials.json"
+    MASTER_CREDENTIALS_FILE = STATE_DIR / "master_credentials.json"
     # Laufzeit-Einstellungen (nicht sicherheitskritisch, z. B. Autostart-Präferenzen)
-    RUNTIME_SETTINGS_FILE = _SCRIPT_DIR / "runtime_settings.json"
+    RUNTIME_SETTINGS_FILE = STATE_DIR / "runtime_settings.json"
     
     # Kameraeinstellungen
     CAMERA_DEVICE = "/dev/video0"
@@ -189,7 +196,7 @@ class Config:
     EMOTION_ALERT_MIN_CONFIDENCE = 0.35
     
     # Logging
-    LOGS_DIR = Path("/var/log/tuxguard")
+    LOGS_DIR = STATE_DIR / "logs"
     LOG_FILE = LOGS_DIR / "tuxguard.log"
     ERROR_LOG_FILE = LOGS_DIR / "error.log"
     LOG_MAX_BYTES = 10 * 1024 * 1024  # 10MB
@@ -218,9 +225,10 @@ class Config:
     def ensure_directories(cls):
         """Stellt sicher, dass alle erforderlichen Verzeichnisse existieren"""
         cls.MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        cls.STATE_DIR.mkdir(parents=True, exist_ok=True)
         cls.LOGS_DIR.mkdir(parents=True, exist_ok=True)
     
     @classmethod
     def get_database_path(cls):
         """Gibt den vollständigen Pfad zur Datenbank zurück"""
-        return cls._SCRIPT_DIR / cls.DATABASE_FILE
+        return cls.STATE_DIR / cls.DATABASE_FILE

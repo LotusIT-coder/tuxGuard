@@ -463,6 +463,24 @@ class CameraManager:
             self.permission_dialog.destroy()
             self.permission_dialog = None
         logger.info("Kamera-Überwachung gestoppt")
+
+    def reset_recognition_state(self, reset_liveness: bool = False):
+        """Erzwingt einen neuen bestätigten Statuswechsel im nächsten Frame.
+
+        Beim Aktivieren eines Sperrbildschirms beginnt optional eine frische
+        Liveness-Sitzung, damit keine abgelaufene Challenge im Hintergrund
+        eine spätere Entsperrung blockiert.
+        """
+        self.last_state = None
+        self.state_candidate = None
+        self.state_since = time.time()
+        if reset_liveness:
+            self.liveness_monitor.reset()
+            self._liveness_challenge_started = False
+            self._last_live_user = None
+            self._last_live_at = 0.0
+            self._hard_fail_user = None
+            self._hard_fail_since = None
     
     def start(self) -> bool:
         """Startet die Kamera-Aufnahme"""
@@ -533,7 +551,13 @@ class CameraManager:
             except Exception as e:
                 logger.error(f"Fehler beim Freigeben der Kamera: {e}")
         
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error as exc:
+            # TuxGuard nutzt Tk-Fenster. Minimal-/headless-OpenCV-Builds
+            # enthalten daher häufig kein HighGUI und dürfen den Stopp nicht
+            # verhindern.
+            logger.debug("OpenCV-HighGUI konnte nicht beendet werden: %s", exc)
         self.stop_monitoring()
         self._emotion_tracks.clear()
         self._emotion_alert_candidate = None

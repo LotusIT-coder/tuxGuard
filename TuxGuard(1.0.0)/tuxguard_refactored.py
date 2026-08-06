@@ -44,7 +44,6 @@ from database import DatabaseManager, SecurityUtils
 from camera import CameraManager
 from simple_ui import (
     MainUI,
-    PinDialog,
     PasswordDialog,
     LoginDialog,
     FirstRunWizard,
@@ -108,9 +107,12 @@ class TuxGuardApplication:
         self.security_lock_windows: List[tk.Toplevel] = []
         self.security_lock_status_label = None
         self.security_lock_status_labels: List[tk.Label] = []
+        self.security_lock_pin_entries: List[tk.Entry] = []
+        self.security_lock_recognized_user: Optional[str] = None
         self.security_lock_unlock_pending = False
-        self.strict_unlock_prompt_active = False
         self.force_admin_unlock_required = False
+        self.security_lock_camera_status = ""
+        self.security_lock_camera_status_level = "INFO"
         self.deadman_triggered = False
         self.last_authorized_seen_at = time.time()
         self.deadman_thread = None
@@ -118,6 +120,7 @@ class TuxGuardApplication:
         self.current_user_is_admin: bool = False
         self.minimize_behavior = Config.MINIMIZE_BEHAVIOR
         self.close_behavior = Config.CLOSE_BEHAVIOR
+        self._load_security_runtime_settings()
 
         # Tippmustererkennung (2. Überwachungsfaktor)
         self.keystroke_monitor = None
@@ -382,6 +385,22 @@ class TuxGuardApplication:
         except Exception as exc:
             self.logger.warning("Runtime-Settings konnten nicht gespeichert werden: %s", exc)
 
+    def _load_security_runtime_settings(self) -> None:
+        """Übernimmt die zuletzt bestätigten Sicherheitsoptionen beim Start."""
+        settings = self._load_runtime_settings()
+        mode = settings.get("security_mode", self.security_mode)
+        action = settings.get("deadman_action", self.deadman_action)
+        timeout = settings.get("deadman_timeout_seconds", self.deadman_timeout_seconds)
+
+        if mode in {"self_unlock", "strict_pin", "deadman"}:
+            self.security_mode = mode
+        if action in {"suspend", "shutdown"}:
+            self.deadman_action = action
+        try:
+            self.deadman_timeout_seconds = max(10, int(timeout))
+        except (TypeError, ValueError):
+            pass
+
     def _load_autostart_monitoring_preference(self) -> bool:
         settings = self._load_runtime_settings()
         default = bool(getattr(Config, "AUTOSTART_MONITORING_DEFAULT", False))
@@ -629,6 +648,11 @@ class TuxGuardApplication:
         self.security_mode = mode
         self.deadman_timeout_seconds = timeout
         self.deadman_action = deadman_action
+        self._save_runtime_settings({
+            "security_mode": self.security_mode,
+            "deadman_timeout_seconds": self.deadman_timeout_seconds,
+            "deadman_action": self.deadman_action,
+        })
         self.logger.info(
             "Sicherheitsmodus aktualisiert: modus=%s timeout=%ss aktion=%s",
             self.security_mode,
@@ -801,10 +825,18 @@ class TuxGuardApplication:
 
         self.security_lock_active = True
         self.security_lock_reason = reason
-        self.strict_unlock_prompt_active = False
         self.security_lock_unlock_pending = False
         self.force_admin_unlock_required = force_admin_password
+        self.security_lock_camera_status = ""
+        self.security_lock_camera_status_level = "INFO"
+        self.security_lock_pin_entries = []
+        self.security_lock_recognized_user = None
         self.logger.warning("Sperrbildschirm aktiviert: %s", reason)
+
+        camera_manager = getattr(self, "camera_manager", None)
+        reset_recognition_state = getattr(camera_manager, "reset_recognition_state", None)
+        if callable(reset_recognition_state):
+            reset_recognition_state(reset_liveness=True)
 
         # Optional: Computer-Session sperren
         if self.lock_target == "computer":
@@ -837,13 +869,61 @@ class TuxGuardApplication:
         # In self_unlock erfolgt die Entsperrung automatisch durch Gesichtserkennung.
         elif self.security_mode == "strict_pin":
             def _trigger_unlock(_event=None):
-                self._prompt_strict_unlock(self.current_user)
+                self._focus_security_lock_pin_entry()
 
             for window in self.security_lock_windows:
                 for sequence in ("<Key>", "<Button-1>", "<Button-2>", "<Button-3>"):
                     window.bind(sequence, _trigger_unlock)
 
         self._update_security_lock_status()
+
+    def _security_lock_heading(self) -> str:
+        """Liefert eine zum aktiven Entsperrmodus passende Überschrift."""
+        if self.force_admin_unlock_required:
+            return "Admin-Entsperrung erforderlich"
+        if self.security_mode == "strict_pin":
+            return "PIN-Entsperrung aktiv"
+        if self.security_mode == "self_unlock":
+            return "Gesichtsentsperrung aktiv"
+        return "Totmannschalter aktiv"
+
+    def _security_lock_liveness_hint(self) -> str:
+        if not Config.LIVENESS_ENABLED:
+            return "Kamera: Gesichtserkennung ohne Lebendigkeitsprüfung."
+
+        checks = []
+        if Config.LIVENESS_REQUIRE_BLINK:
+            checks.append("blinzeln")
+        if Config.LIVENESS_REQUIRE_PARALLAX:
+            checks.append("den Kopf leicht bewegen")
+        if Config.LIVENESS_ACTIVE_CHALLENGE_ENABLED:
+            checks.append("eine angezeigte Kamera-Challenge erfüllen")
+        if not checks:
+            return "Kamera: Lebendigkeitsprüfung aktiv."
+        return "Kamera: Bitte " + " und ".join(checks) + "."
+
+    def _security_lock_target_hint(self) -> str:
+        if self.lock_target == "computer":
+            return (
+                "Sperrziel: System-Sitzung. Wenn der Desktop-Sperrbildschirm sichtbar ist, "
+                "verwaltet er Tastatur, Maus und Entsperrung selbst. Die TuxGuard-PIN und "
+                "Gesichtserkennung funktionieren nur auf diesem TuxGuard-Overlay."
+            )
+        return "Sperrziel: TuxGuard-Overlay. PIN- und Kameraentsperrung bleiben aktiv."
+
+    def _security_lock_interaction_hint(self) -> str:
+        if self.force_admin_unlock_required:
+            return "Klicken Sie auf den Knopf oder drücken Sie eine Taste für das Admin-Passwort."
+        if self.security_mode == "strict_pin":
+            return "Geben Sie die PIN direkt im Sperrbildschirm ein und bestätigen Sie sie."
+        if self.security_mode == "self_unlock":
+            return "Die Entsperrung erfolgt ausschließlich über eine bestätigte Gesichtserkennung."
+        return "Der Totmannschalter führt die konfigurierte Schutzaktion aus."
+
+    def _security_lock_action(self):
+        if self.force_admin_unlock_required:
+            return "Admin-Passwort eingeben", self._prompt_lock_unlock
+        return None, None
 
     def _get_security_lock_geometries(self):
         """Ermittelt die Geometrien aller sichtbaren Bildschirme.
@@ -903,7 +983,7 @@ class TuxGuardApplication:
 
         tk.Label(
             content,
-            text="🔒 TuxGuard hat den Bildschirm gesperrt",
+            text=f"🔒 {self._security_lock_heading()}",
             font=("Arial", 24, "bold"),
             fg="white",
             bg="black",
@@ -917,11 +997,66 @@ class TuxGuardApplication:
         ).pack(pady=(0, 14))
         tk.Label(
             content,
-            text="Drücken Sie eine Taste oder klicken Sie, um das Passwort einzugeben.",
+            text=self._security_lock_interaction_hint(),
             font=("Arial", 12),
             fg="#cfe8ff",
             bg="black",
-        ).pack(pady=(0, 20))
+            wraplength=max(360, width - 80),
+            justify=tk.CENTER,
+        ).pack(pady=(0, 14))
+
+        action_label, action_callback = self._security_lock_action()
+        if action_label and action_callback:
+            tk.Button(
+                content,
+                text=action_label,
+                command=action_callback,
+                bg="#2e8b57",
+                fg="white",
+                activebackground="#3da66d",
+                activeforeground="white",
+                font=("Arial", 13, "bold"),
+                padx=20,
+                pady=8,
+                bd=0,
+            ).pack(pady=(0, 20))
+
+        if self.security_mode == "strict_pin" and not self.force_admin_unlock_required:
+            pin_frame = tk.Frame(content, bg="black")
+            pin_frame.pack(fill=tk.X, padx=28, pady=(0, 18))
+            tk.Label(
+                pin_frame,
+                text="PIN",
+                font=("Arial", 12, "bold"),
+                fg="white",
+                bg="black",
+            ).pack(anchor="w", pady=(0, 5))
+            pin_entry = tk.Entry(
+                pin_frame,
+                show="●",
+                font=("Arial", 16),
+                justify="center",
+                bg="#ffffff",
+                fg="#111111",
+                insertbackground="#111111",
+                bd=2,
+            )
+            pin_entry.pack(fill=tk.X, pady=(0, 8))
+            pin_entry.bind("<Return>", lambda _event, entry=pin_entry: self._submit_security_lock_pin(entry))
+            tk.Button(
+                pin_frame,
+                text="Entsperren",
+                command=lambda entry=pin_entry: self._submit_security_lock_pin(entry),
+                bg="#2e8b57",
+                fg="white",
+                activebackground="#3da66d",
+                activeforeground="white",
+                font=("Arial", 12, "bold"),
+                padx=18,
+                pady=7,
+                bd=0,
+            ).pack()
+            self.security_lock_pin_entries.append(pin_entry)
 
         status_label = tk.Label(
             content,
@@ -950,6 +1085,17 @@ class TuxGuardApplication:
         except Exception as exc:
             self.logger.error("System-Lock fehlgeschlagen: %s", exc)
 
+    def _security_lock_dialog_parent(self):
+        """Liefert das Sperr-Overlay, das aktuell die Eingabe besitzt."""
+        try:
+            active_grab = self.root.grab_current()
+        except (AttributeError, tk.TclError):
+            active_grab = None
+
+        if active_grab in getattr(self, "security_lock_windows", []):
+            return active_grab
+        return getattr(self, "security_lock_window", None) or self.root
+
     def _prompt_lock_unlock(self):
         """Zeigt den Admin-Passwort-Dialog zur Aufhebung der TuxGuard-Sperre."""
         if not self.security_lock_active or self.security_lock_unlock_pending:
@@ -957,12 +1103,16 @@ class TuxGuardApplication:
         self.security_lock_unlock_pending = True
         try:
             dialog = PasswordDialog(
-                self.security_lock_window or self.root,
+                self._security_lock_dialog_parent(),
                 title="TuxGuard – Bildschirm entsperren",
                 reason="Bitte geben Sie ein gültiges Admin-Passwort ein.",
                 allow_cancel=False,
             )
-            password = dialog.show()
+            try:
+                password = dialog.show()
+            except tk.TclError as exc:
+                self.logger.error("Admin-Passwort-Dialog konnte nicht geöffnet werden: %s", exc)
+                return
             if not password:
                 return
             if not self.master_auth.verify_admin_password(password):
@@ -977,7 +1127,8 @@ class TuxGuardApplication:
 
     def _update_security_lock_status(self):
         """Aktualisiert den Hinweistext des Sperrbildschirms."""
-        if not self.security_lock_status_labels:
+        status_labels = getattr(self, "security_lock_status_labels", [])
+        if not status_labels:
             return
 
         if self.security_mode == "deadman":
@@ -989,20 +1140,38 @@ class TuxGuardApplication:
             )
         elif self.force_admin_unlock_required:
             text = (
-                "Keine gültigen Benutzerdaten verfügbar.\n"
-                "Entsperren ist nur mit einem Admin-Passwort möglich."
+                "Admin-Entsperrung erforderlich.\n"
+                "Keine gültigen Benutzerdaten verfügbar."
             )
         elif self.security_mode == "self_unlock":
-            text = ("Warte auf einen legitimen Nutzer.\n"
-                    "Die Sperre wird automatisch aufgehoben, sobald ein bekannter\n"
-                    "Nutzer im Kamerabild erkannt wird.")
+            text = (
+                "Gesichtsentsperrung aktiv.\n"
+                "Die Sperre wird nach einer bestätigten Erkennung automatisch aufgehoben.\n"
+                f"{self._security_lock_liveness_hint()}"
+            )
         else:  # strict_pin
-            text = ("Warte auf einen legitimen Nutzer.\n"
-                    "Sobald die Kamera einen bekannten Nutzer erkennt,\n"
-                    "erscheint die PIN-Abfrage zur Entsperrung.\n"
-                    "Alternativ: beliebige Taste/Mausklick → PIN-Abfrage.")
-        for status_label in self.security_lock_status_labels:
-            status_label.config(text=text)
+            text = (
+                "PIN-Entsperrung aktiv.\n"
+                "Eine bestätigte Gesichtserkennung öffnet die PIN-Abfrage für diesen Nutzer.\n"
+                f"{self._security_lock_liveness_hint()}"
+            )
+        camera_status = str(getattr(self, "security_lock_camera_status", "") or "").strip()
+        if camera_status:
+            text = f"{text}\nKamera: {camera_status}"
+        text = f"{text}\n{self._security_lock_interaction_hint()}\n{self._security_lock_target_hint()}"
+        level_colors = {
+            "INFO": "#cfe8ff",
+            "SUCCESS": "#98e698",
+            "WARN": "#ffd27f",
+            "WARNING": "#ffd27f",
+            "ERROR": "#ffb3b3",
+        }
+        color = level_colors.get(
+            str(getattr(self, "security_lock_camera_status_level", "INFO")).upper(),
+            "#cfe8ff",
+        )
+        for status_label in status_labels:
+            status_label.config(text=text, fg=color)
 
     def _release_security_lock(self, user_name: Optional[str] = None):
         """Hebt den Sperrbildschirm wieder auf."""
@@ -1019,11 +1188,14 @@ class TuxGuardApplication:
         self.security_lock_windows = []
         self.security_lock_status_label = None
         self.security_lock_status_labels = []
+        self.security_lock_pin_entries = []
+        self.security_lock_recognized_user = None
         self.security_lock_active = False
         self.security_lock_reason = ""
-        self.strict_unlock_prompt_active = False
         self.security_lock_unlock_pending = False
         self.force_admin_unlock_required = False
+        self.security_lock_camera_status = ""
+        self.security_lock_camera_status_level = "INFO"
 
         # Falls die Kamera während der Sperrphase freigegeben/gestoppt wurde,
         # wird die aktive Überwachung nach Entsperren sofort wieder angehoben.
@@ -1043,46 +1215,81 @@ class TuxGuardApplication:
             self.ui.add_security_log(f"Sperrbildschirm aufgehoben: {user_name}", "SUCCESS")
             self.logger.info("Sperrbildschirm aufgehoben durch legitimen Nutzer: %s", user_name)
 
-    def _prompt_strict_unlock(self, user_name: Optional[str]):
-        """Im strict_pin-Modus: PIN-Eingabe zum Aufheben der Sperre.
-
-        Wird sowohl bei Tasten-/Mausereignis (manueller Auslöser) als auch
-        nach erkanntem legitimen Nutzer aufgerufen.
-        """
-        if not self.security_lock_active or self.strict_unlock_prompt_active:
+    def _focus_security_lock_pin_entry(self):
+        """Aktiviert das PIN-Feld des Sperr-Overlays ohne ein weiteres Fenster."""
+        entries = getattr(self, "security_lock_pin_entries", [])
+        if not entries:
             return
-        self.strict_unlock_prompt_active = True
         try:
-            reason = (
-                f"Legitimer Nutzer erkannt: {user_name}\n"
-                "Bitte PIN zum Entsperren eingeben."
-                if user_name
-                else "Bitte PIN zum Entsperren eingeben."
-            )
-            pin_dialog = PinDialog(
-                self.security_lock_window or self.root,
-                "Entsperren bestätigen",
-                reason,
-            )
-            pin = pin_dialog.show()
-            if pin is None:
-                return
-            # Bei erkanntem Nutzer muss dessen PIN passen; ohne erkannten Nutzer
-            # bleibt der bisherige Fallback erhalten.
-            if user_name:
-                pin_valid = self.db_manager.verify_user_pin_for_user(user_name, pin)
-            else:
-                pin_valid = self.db_manager.verify_user_pin(pin)
+            active_window = self._security_lock_dialog_parent()
+            for entry in entries:
+                if entry.winfo_toplevel() is active_window:
+                    entry.focus_set()
+                    return
+            entries[0].focus_set()
+        except tk.TclError:
+            pass
 
-            if pin_valid:
-                self.last_authorized_seen_at = time.time()
-                self.deadman_triggered = False
-                self._release_security_lock(user_name)
-            else:
-                self.ui.add_security_log("PIN für Strict-Mode war falsch", "ERROR")
-                self.logger.warning("Strict-Mode-Entsperrung mit falscher PIN")
-        finally:
-            self.strict_unlock_prompt_active = False
+    def _prompt_strict_unlock(self, user_name: Optional[str]):
+        """Verknüpft eine bestätigte Gesichtserkennung mit dem PIN-Feld."""
+        if not self.security_lock_active:
+            return
+        self.security_lock_recognized_user = user_name
+        if user_name:
+            self.security_lock_camera_status = (
+                f"Legitimer Nutzer erkannt: {user_name}. PIN eingeben."
+            )
+            self.security_lock_camera_status_level = "SUCCESS"
+            self._update_security_lock_status()
+        self._focus_security_lock_pin_entry()
+
+    def _submit_security_lock_pin(self, pin_entry):
+        """Prüft die direkt im Sperrbildschirm eingegebene PIN."""
+        if not self.security_lock_active:
+            return False
+        pin = pin_entry.get()
+        if not pin:
+            self.security_lock_camera_status = "Bitte eine PIN eingeben."
+            self.security_lock_camera_status_level = "WARN"
+            self._update_security_lock_status()
+            self._focus_security_lock_pin_entry()
+            return False
+
+        user_name = getattr(self, "security_lock_recognized_user", None)
+        if user_name:
+            pin_valid = self.db_manager.verify_user_pin_for_user(user_name, pin)
+        else:
+            pin_valid = self.db_manager.verify_user_pin(pin)
+
+        try:
+            pin_entry.delete(0, tk.END)
+        except tk.TclError:
+            pass
+
+        if pin_valid:
+            self.last_authorized_seen_at = time.time()
+            self.deadman_triggered = False
+            self._release_security_lock(user_name)
+            return True
+
+        self.security_lock_camera_status = "PIN ungültig. Bitte erneut eingeben."
+        self.security_lock_camera_status_level = "ERROR"
+        self.ui.add_security_log("PIN für Strict-Mode war falsch", "ERROR")
+        self.logger.warning("Strict-Mode-Entsperrung mit falscher PIN")
+        self._update_security_lock_status()
+        self._focus_security_lock_pin_entry()
+        return False
+
+    def _schedule_self_unlock(self, user_name: str):
+        """Plant die Kamera-Entsperrung im Tk-Hauptthread ein."""
+        if (
+            self.security_lock_active
+            and self.security_mode == "self_unlock"
+            and not self.force_admin_unlock_required
+            and not self.security_lock_unlock_pending
+        ):
+            self.security_lock_unlock_pending = True
+            self.root.after(0, lambda u=user_name: self._auto_release_self_unlock(u))
 
     def _auto_release_self_unlock(self, user_name: str):
         """Hebt im self_unlock-Modus die Sperre automatisch auf, sobald
@@ -1917,9 +2124,6 @@ class TuxGuardApplication:
         """Heartbeat: jeder Frame mit legitimem Nutzer setzt den Sperr-Timer
         sofort zurück. Wird auch ohne Statuswechsel und ohne Logging gefeuert,
         damit kurze Erkennungen den 10-Sekunden-Countdown neu starten.
-
-        Im ``self_unlock``-Modus wird der Sperrbildschirm zusätzlich automatisch
-        aufgehoben, sobald ein legitimer Nutzer erkannt wird.
         """
         now = time.time()
         self.last_face_seen_at = now
@@ -1929,15 +2133,6 @@ class TuxGuardApplication:
             self.last_authorized_seen_at = now
         if self.deadman_triggered:
             self.deadman_triggered = False
-        if (
-            self.security_lock_active
-            and self.security_mode == "self_unlock"
-            and not self.force_admin_unlock_required
-            and not self.security_lock_unlock_pending
-        ):
-            # Auf den Tk-Hauptthread zurückschalten (UI-Operationen).
-            self.security_lock_unlock_pending = True
-            self.root.after(0, lambda u=user_name: self._auto_release_self_unlock(u))
 
     def _on_camera_preview_updated(self, image: Image.Image, status_text: str, status_level: str):
         """Aktualisiert die kleine Monitoring-Vorschau im Hauptfenster."""
@@ -1945,19 +2140,34 @@ class TuxGuardApplication:
             preview = ImageTk.PhotoImage(image=image)
             self.root.after(
                 0,
-                lambda: self.ui.update_monitor_preview(preview, status_text, status_level)
+                lambda: self._handle_camera_preview_updated(preview, status_text, status_level),
             )
         except Exception as e:
             self.logger.debug("Monitoring-Vorschau konnte nicht aktualisiert werden: %s", e)
 
+    def _handle_camera_preview_updated(self, preview, status_text: str, status_level: str):
+        """Aktualisiert Vorschau und zeigt Liveness-Anweisungen im Lock-Screen."""
+        self.ui.update_monitor_preview(preview, status_text, status_level)
+        if not self.security_lock_active:
+            return
+
+        normalized_status = str(status_text or "").strip()
+        normalized_level = str(status_level or "INFO").upper()
+        if (
+            normalized_status == self.security_lock_camera_status
+            and normalized_level == self.security_lock_camera_status_level
+        ):
+            return
+        self.security_lock_camera_status = normalized_status
+        self.security_lock_camera_status_level = normalized_level
+        self._update_security_lock_status()
+
     def _handle_user_recognized(self, user_name: str):
         """Verarbeitet erkannte Benutzer im Tk-Hauptthread.
 
-        - ``self_unlock``: Sperre wird über den Heartbeat (`_on_user_seen`)
-          ohne weitere Eingabe automatisch aufgehoben.
-        - ``strict_pin``: Sperre wird erst nach erfolgreicher PIN-Eingabe
-          aufgehoben; der Dialog wird hier ausgelöst.
-        - ``deadman``: keine Aufhebung über die Erkennung.
+        Dieser Callback wird erst nach einer bestätigten Liveness-Prüfung und
+        stabilem Kamera-Status ausgelöst. Er ist daher der verbindliche Einstieg
+        für PIN- und Gesichtsentsperrung.
         """
         self.last_face_seen_at = time.time()
         if not self._fusion_active():
@@ -1965,12 +2175,16 @@ class TuxGuardApplication:
         self.deadman_triggered = False
         self.ui.add_security_log(f"Benutzer erkannt: {user_name}")
         self.logger.info(f"Autorisierter Zugriff: {user_name}")
-        if (
-            self.security_lock_active
-            and self.security_mode == "strict_pin"
-            and not self.strict_unlock_prompt_active
-        ):
+        if not self.security_lock_active or self.force_admin_unlock_required:
+            return
+        self.security_lock_camera_status = f"Gesicht von {user_name} bestätigt."
+        self.security_lock_camera_status_level = "SUCCESS"
+        self._update_security_lock_status()
+        if self.security_mode == "strict_pin":
             self._prompt_strict_unlock(user_name)
+        elif self.security_mode == "self_unlock":
+            self.logger.info("Gesichtsentsperrung angefordert: %s", user_name)
+            self._schedule_self_unlock(user_name)
     
     def _on_unauthorized_access(self):
         """Wird thread-sicher auf den Tk-Hauptthread umgeleitet."""

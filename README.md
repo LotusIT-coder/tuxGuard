@@ -67,6 +67,31 @@ Installieren:
 sudo bash install.sh
 ```
 
+### Debian-Paket
+
+Das Debian-Paket enthaelt den Anwendungscode, das Gesichtserkennungsmodell und
+die Python-Laufzeit aus der Projekt-`.venv`. Es installiert keine Python-Pakete
+ueber `pip` und benoetigt beim Installieren nur Zugriff auf die konfigurierten
+APT-Systempakete.
+
+Paket lokal erstellen:
+
+```bash
+./packaging/build-deb.sh
+```
+
+Danach kann es direkt installiert werden:
+
+```bash
+sudo apt install ./tuxGuard.deb -y
+```
+
+Der Launcher `tuxguard` wird nach `/usr/bin/tuxguard` installiert und ist damit
+ohne eine zusaetzliche PATH-Konfiguration im Standard-PATH verfuegbar. Lokale
+Benutzer-, Datenbank-, Log- und Laufzeitdaten werden bei der ersten Nutzung
+unter `$XDG_STATE_HOME/tuxguard` beziehungsweise `~/.local/state/tuxguard`
+angelegt; sie sind nicht Bestandteil des Pakets.
+
 Starten:
 
 ```bash
